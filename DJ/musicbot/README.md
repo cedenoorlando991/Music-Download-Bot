@@ -123,12 +123,23 @@ tail -f /Users/orlandocedeno/Library/Logs/musicbot.log
 
 From Telegram, send the bot any of:
 
-- a **YouTube** or **SoundCloud** link → downloaded directly
-- a **Spotify** link → track info read, matching audio pulled from YouTube (via
-  spotdl; Spotify's own audio is DRM-protected)
-- a **Shazam** link → resolved to a song name, then found on YouTube
-- a plain **song name** → YouTube search
-- several links at once (one per line) → all downloaded
+- a **YouTube** link (video, youtu.be, Music) → downloaded directly
+- a **SoundCloud** link (track or public playlist) → downloaded directly
+- a **Spotify** link (track, album, or playlist) → track info read, matching
+  audio pulled from YouTube via spotdl (Spotify's own audio is DRM-protected;
+  playlists/albums expand and download track by track)
+- a **Shazam** link (shazam.com or shz.am share links) → resolved to a song
+  name, then found on YouTube
+- a link from **any other yt-dlp-supported site** (Bandcamp, Vimeo, Mixcloud,
+  and hundreds more) → passed straight to music-dl; works if yt-dlp can extract
+  audio from it
+- a plain **song name** (e.g. `daft punk one more time`) → YouTube search,
+  preferring lyric videos
+- several links at once (one per line) → all downloaded, each reported
+  separately
+
+Every download lands as an MP3 in `DJ/Music/`, and a download archive prevents
+re-downloading anything already in your library.
 
 Commands: `/start`, `/help`, `/id` (shows your Telegram user ID for the allowlist).
 
@@ -146,6 +157,7 @@ window, or set "prevent sleep" in System Settings.
 | Spotify links error about spotdl | `./venv/bin/python3 -m pip install spotdl` in the musicbot folder, then reload. |
 | Downloads never finish | Mac is asleep — see `caffeinate` above. Long items may hit the 30-min timeout (`MUSIC_DL_TIMEOUT` in `.env`, seconds). |
 | `launchctl load` says "already loaded" | Unload first, then load. |
+| Moved/renamed the repo folder | The venv bakes absolute paths — recreate it: `rm -rf venv && python3 -m venv venv && ./venv/bin/python3 -m pip install -r requirements.txt`. Also re-copy the plist and reload. |
 
 ## Security notes
 

@@ -24,17 +24,34 @@ Environment variables
                                   can use the bot except via /id (which is
                                   always allowed so you can discover your ID).
   MUSIC_DL            (required)  Absolute path to your music-dl script.
-  MUSIC_DIR           (optional)  Absolute path to the Music output folder,
-                                  used only to tell you where files landed and
-                                  to detect the newest file after a download.
+  MUSIC_DIR           (optional)  Absolute path to the Music output folder.
+                                  Used to report saved filenames, to detect the
+                                  newest file after a download, and as the
+                                  destination for Spotify downloads via spotdl.
+  SPOTDL              (optional)  Absolute path to the spotdl executable. If
+                                  unset, we look next to this Python (the venv's
+                                  bin/spotdl) and then fall back to PATH.
+
+Link routing
+------------
+Any link (or bare song name) you send is routed automatically:
+  * YouTube / SoundCloud / other yt-dlp sites -> downloaded directly by music-dl.
+  * Spotify links -> spotdl reads the track metadata and downloads the matching
+    audio from YouTube (Spotify audio itself is DRM-protected and cannot be
+    downloaded). spotdl must be installed in the venv (pip install spotdl).
+  * Shazam links -> we resolve the link to "artist - title" and then run a
+    YouTube search through music-dl.
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
 import shlex
+import sys
 import time
+import urllib.request
 from pathlib import Path
 
 from telegram import Update
@@ -86,6 +103,36 @@ MUSIC_DIR = os.environ.get("MUSIC_DIR", "").strip()
 # How long (seconds) to let a single music-dl invocation run before giving up.
 # A long song / slow network can take a while, so this is generous.
 SUBPROCESS_TIMEOUT = int(os.environ.get("MUSIC_DL_TIMEOUT", "1800"))  # 30 min
+
+
+def _discover_spotdl() -> str:
+    """
+    Locate the spotdl executable. Prefer the one installed alongside this
+    Python (i.e. inside the same venv), since that's where `pip install spotdl`
+    in the venv puts it; otherwise fall back to whatever is on PATH.
+    """
+    explicit = os.environ.get("SPOTDL", "").strip()
+    if explicit:
+        return explicit
+    candidate = Path(sys.executable).parent / "spotdl"
+    if candidate.exists():
+        return str(candidate)
+    return "spotdl"  # rely on PATH; may not exist (handled at call time)
+
+
+SPOTDL = _discover_spotdl()
+
+
+def music_output_dir() -> str:
+    """
+    Where downloaded audio should live. Uses MUSIC_DIR if set, else the ./Music
+    folder next to the music-dl script (matching music-dl's own default).
+    """
+    if MUSIC_DIR:
+        return MUSIC_DIR
+    if MUSIC_DL:
+        return str(Path(MUSIC_DL).resolve().parent / "Music")
+    return os.getcwd()
 
 # Telegram messages cap out at 4096 chars; keep our replies safely under that.
 MAX_TG_MESSAGE = 3500
@@ -166,31 +213,27 @@ def _newest_music_file(since: float) -> str | None:
     return newest_name
 
 
-async def run_music_dl(arg: str) -> tuple[int, str, str]:
+async def _run_subprocess(argv: list[str], cwd: str) -> tuple[int, str, str]:
     """
-    Run `music-dl <arg>` in one-shot mode as a subprocess.
+    Run a command (no shell) and capture output.
 
-    Returns (return_code, stdout, stderr). return_code is -1 on timeout.
+    Returns (return_code, stdout, stderr); return_code is -1 on timeout.
+    Passing argv as a list means arguments with spaces/quotes are delivered
+    verbatim — there is no shell-injection surface from message text.
     """
-    # NOTE: we pass MUSIC_DL and arg as separate argv entries (no shell), so a
-    # song title with spaces/quotes is delivered to music-dl as a single
-    # argument and there is no shell-injection surface.
-    log.info("Running: %s %s", MUSIC_DL, shlex.quote(arg))
+    log.info("Running: %s", " ".join(shlex.quote(a) for a in argv))
     proc = await asyncio.create_subprocess_exec(
-        MUSIC_DL,
-        arg,
+        *argv,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        # Run inside the script's own directory so its relative ./Music and
-        # ./.download-archive.txt resolve the way they do when run by hand.
-        cwd=str(Path(MUSIC_DL).resolve().parent),
+        cwd=cwd,
     )
     try:
         stdout_b, stderr_b = await asyncio.wait_for(
             proc.communicate(), timeout=SUBPROCESS_TIMEOUT
         )
     except asyncio.TimeoutError:
-        log.error("music-dl timed out after %ss; killing.", SUBPROCESS_TIMEOUT)
+        log.error("Command timed out after %ss; killing.", SUBPROCESS_TIMEOUT)
         try:
             proc.kill()
         except ProcessLookupError:
@@ -201,6 +244,40 @@ async def run_music_dl(arg: str) -> tuple[int, str, str]:
     stdout = stdout_b.decode("utf-8", "replace")
     stderr = stderr_b.decode("utf-8", "replace")
     return proc.returncode if proc.returncode is not None else -1, stdout, stderr
+
+
+async def run_music_dl(arg: str) -> tuple[int, str, str]:
+    """
+    Run `music-dl <arg>` in one-shot mode. `arg` is a direct URL (YouTube,
+    SoundCloud, …) or a search string. music-dl runs from its own directory so
+    its relative ./Music and ./.download-archive.txt resolve as they do by hand.
+    """
+    return await _run_subprocess(
+        [MUSIC_DL, arg],
+        cwd=str(Path(MUSIC_DL).resolve().parent),
+    )
+
+
+async def run_spotdl(url: str) -> tuple[int, str, str]:
+    """
+    Download a Spotify track/album/playlist via spotdl. spotdl reads the
+    Spotify metadata and fetches the matching audio from YouTube, saving mp3s
+    into MUSIC_DIR (Spotify's own audio is DRM-protected and can't be pulled).
+    """
+    outdir = music_output_dir()
+    os.makedirs(outdir, exist_ok=True)
+    # Force mp3 and a clean "Artist - Title.mp3" name, saved into the music dir.
+    output_template = os.path.join(outdir, "{artists} - {title}.{output-ext}")
+    argv = [
+        SPOTDL,
+        "download",
+        url,
+        "--format",
+        "mp3",
+        "--output",
+        output_template,
+    ]
+    return await _run_subprocess(argv, cwd=outdir)
 
 
 # Audio extensions we consider a "final" music file.
@@ -320,12 +397,180 @@ def summarize_result(rc: int, stdout: str, stderr: str, newest: str | None) -> s
 
 
 # --------------------------------------------------------------------------- #
+# Spotify (spotdl) output parsing
+# --------------------------------------------------------------------------- #
+
+# spotdl prints one line per track, e.g.:  Downloaded "Artist - Title"
+_SPOTDL_DOWNLOADED = re.compile(r'Downloaded\s+"([^"]+)"')
+# and for files it skips:  Skipping Artist - Title (file already exists)
+_SPOTDL_SKIPPED = re.compile(r'Skipping\s+(.+?)\s+\(file already exists', re.IGNORECASE)
+
+
+def summarize_spotdl(rc: int, stdout: str, stderr: str) -> str:
+    """Turn spotdl's output into a friendly reply, naming each saved track."""
+    if rc == -1:
+        return "⏱️ Timed out. The Spotify download took too long and was stopped."
+
+    text = stdout + "\n" + stderr
+    downloaded = [m.group(1) for m in _SPOTDL_DOWNLOADED.finditer(text)]
+    skipped = [m.group(1) for m in _SPOTDL_SKIPPED.finditer(text)]
+
+    # spotdl's "Downloaded" names have no extension; we save as .mp3.
+    names = [n if n.lower().endswith(".mp3") else f"{n}.mp3" for n in downloaded]
+
+    if rc == 0:
+        if names:
+            if len(names) == 1:
+                return f"✅ Done (via Spotify → YouTube)! Saved:\n{names[0]}"
+            listed = "\n".join(f"• {n}" for n in names)
+            return f"✅ Done (via Spotify → YouTube)! Saved {len(names)} tracks:\n{listed}"
+        if skipped:
+            return "✅ Already in your library — skipped (no re-download)."
+        return "✅ Done! Spotify download finished."
+
+    # Failure: surface the tail so the user has a clue.
+    detail = (stderr.strip() or stdout.strip() or "no output").splitlines()
+    tail = "\n".join(detail[-8:])[:1500]
+    return f"❌ spotdl failed (exit {rc}):\n{tail}"
+
+
+# --------------------------------------------------------------------------- #
+# Shazam link resolution  (link -> "artist title" search string)
+# --------------------------------------------------------------------------- #
+
+_SHAZAM_TITLE_TAG = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+_OG_TITLE = re.compile(
+    r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']',
+    re.IGNORECASE,
+)
+
+
+def _search_json_for_recording(obj) -> str | None:
+    """Recursively look for a MusicRecording-like dict and build 'artist title'."""
+    if isinstance(obj, dict):
+        types = obj.get("@type")
+        types = types if isinstance(types, list) else [types]
+        if any(t in ("MusicRecording", "MusicComposition", "Song") for t in types):
+            name = obj.get("name")
+            artist = obj.get("byArtist")
+            if isinstance(artist, dict):
+                artist = artist.get("name")
+            elif isinstance(artist, list) and artist:
+                first = artist[0]
+                artist = first.get("name") if isinstance(first, dict) else first
+            if name:
+                return f"{artist} {name}".strip() if artist else str(name)
+        for value in obj.values():
+            found = _search_json_for_recording(value)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _search_json_for_recording(item)
+            if found:
+                return found
+    return None
+
+
+def resolve_shazam(url: str) -> str | None:
+    """
+    Turn a Shazam link into an "artist title" search string. Shazam is a song
+    ID service, not an audio source, so we scrape the shared page's metadata and
+    then let music-dl find the track on YouTube.
+
+    Strategy (most reliable first): JSON-LD MusicRecording -> og:title ->
+    <title> tag. Returns None if nothing usable can be extracted.
+    """
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0 Safari/537.36"
+            )
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            html_text = resp.read().decode("utf-8", "replace")
+    except Exception as exc:  # network/HTTP errors — degrade gracefully
+        log.warning("Shazam fetch failed for %s: %s", url, exc)
+        return None
+
+    # 1) JSON-LD blocks (most structured/reliable).
+    for block in re.findall(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html_text,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        try:
+            data = json.loads(block.strip())
+        except json.JSONDecodeError:
+            continue
+        found = _search_json_for_recording(data)
+        if found:
+            return _clean_query(found)
+
+    # 2) og:title meta.
+    m = _OG_TITLE.search(html_text)
+    if m:
+        return _clean_query(m.group(1))
+
+    # 3) <title> tag, e.g. "Song - Artist | Shazam".
+    m = _SHAZAM_TITLE_TAG.search(html_text)
+    if m:
+        title = re.sub(r"\s*\|\s*Shazam.*$", "", m.group(1), flags=re.IGNORECASE)
+        return _clean_query(title.replace(" - ", " "))
+
+    return None
+
+
+def _clean_query(text: str) -> str:
+    """Normalize an extracted title into a plain search string."""
+    import html as _html
+
+    text = _html.unescape(text).strip()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+# --------------------------------------------------------------------------- #
+# URL routing
+# --------------------------------------------------------------------------- #
+
+def is_url(token: str) -> bool:
+    return token.startswith(("http://", "https://", "spotify:"))
+
+
+def classify(token: str) -> tuple[str, str]:
+    """
+    Decide how to handle one token. Returns (kind, value):
+      "spotify" -> download via spotdl
+      "shazam"  -> resolve link, then YouTube-search via music-dl
+      "direct"  -> hand the URL straight to music-dl (YouTube/SoundCloud/etc.)
+      "search"  -> treat the text as a YouTube search query for music-dl
+    """
+    low = token.lower()
+    if not is_url(token):
+        return ("search", token)
+    if "open.spotify.com" in low or low.startswith("spotify:"):
+        return ("spotify", token)
+    if "shazam.com" in low or "shz.am" in low:
+        return ("shazam", token)
+    return ("direct", token)
+
+
+# --------------------------------------------------------------------------- #
 # Handlers
 # --------------------------------------------------------------------------- #
 
 HELP_TEXT = (
     "🎵 *Music download bot*\n\n"
-    "Send me a YouTube link and I'll download it as an MP3 on the home Mac.\n\n"
+    "Paste a link and I'll download it as an MP3 on the home Mac:\n"
+    "• *YouTube* / *SoundCloud* — downloaded directly.\n"
+    "• *Spotify* — I read the track info and grab the matching YouTube audio.\n"
+    "• *Shazam* — I look up the song, then grab it from YouTube.\n\n"
     "You can also:\n"
     "• Send a song name (e.g. `daft punk one more time`) — I'll search YouTube.\n"
     "• Send several links at once, one per line — I'll grab them all.\n\n"
@@ -358,8 +603,51 @@ async def cmd_id(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def process_job(kind: str, value: str) -> str:
+    """Run one download job and return the reply text. Never raises."""
+    try:
+        if kind == "spotify":
+            try:
+                rc, out, err = await run_spotdl(value)
+            except FileNotFoundError:
+                return (
+                    "❌ Spotify links need spotdl, which isn't installed.\n"
+                    "Install it in the bot's venv:\n"
+                    "  <venv>/bin/python3 -m pip install spotdl"
+                )
+            return summarize_spotdl(rc, out, err)
+
+        if kind == "shazam":
+            query = await asyncio.to_thread(resolve_shazam, value)
+            if not query:
+                return (
+                    "❌ Couldn't read that Shazam link. Try opening it and "
+                    "sending me the song name instead."
+                )
+            started = time.time()
+            rc, out, err = await run_music_dl(query)
+            base = summarize_result(rc, out, err, _newest_music_file(started))
+            return f"🎧 Shazam → {query}\n{base}"
+
+        # "direct" (YouTube/SoundCloud/etc.) or "search" — both go to music-dl.
+        try:
+            started = time.time()
+            rc, out, err = await run_music_dl(value)
+        except FileNotFoundError:
+            return (
+                "❌ Could not run music-dl.\n"
+                f"MUSIC_DL is set to: {MUSIC_DL or '(unset)'}\n"
+                "Check that the path is correct and the file is executable."
+            )
+        return summarize_result(rc, out, err, _newest_music_file(started))
+
+    except Exception as exc:  # defensive: never let a job crash the handler
+        log.exception("Unexpected error in job %s(%r)", kind, value)
+        return f"❌ Unexpected error: {exc}"
+
+
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Any non-command text message: treat it as input for music-dl."""
+    """Any non-command text message: route each link/query to the right downloader."""
     if not is_authorized(update):
         await deny(update)
         return
@@ -367,39 +655,23 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     message = update.effective_message
     text = (message.text or "").strip()
     if not text:
-        await message.reply_text("Send me a YouTube link or a song name.")
+        await message.reply_text("Send me a link (YouTube/SoundCloud/Spotify/Shazam) or a song name.")
         return
 
-    # If the message contains URLs, treat each whitespace/newline-separated URL
-    # as its own download. Otherwise treat the whole message as a search query.
+    # If the message contains links, handle each one; otherwise treat the whole
+    # message as a single search query.
     tokens = text.split()
-    urls = [t for t in tokens if t.startswith("http://") or t.startswith("https://")]
-    args = urls if urls else [text]
+    links = [t for t in tokens if is_url(t)]
+    jobs = [classify(t) for t in links] if links else [classify(text)]
 
     # Immediate acknowledgment so the user knows we're on it.
-    ack = "⬇️ Downloading…" if len(args) == 1 else f"⬇️ Downloading {len(args)} items…"
+    ack = "⬇️ Downloading…" if len(jobs) == 1 else f"⬇️ Downloading {len(jobs)} items…"
     await message.reply_text(ack)
     await ctx.bot.send_chat_action(message.chat_id, ChatAction.TYPING)
 
-    for i, arg in enumerate(args, start=1):
-        prefix = f"[{i}/{len(args)}] " if len(args) > 1 else ""
-        started = time.time()
-        try:
-            rc, out, err = await run_music_dl(arg)
-        except FileNotFoundError:
-            await message.reply_text(
-                f"{prefix}❌ Could not run music-dl.\n"
-                f"MUSIC_DL is set to: {MUSIC_DL or '(unset)'}\n"
-                "Check that the path is correct and the file is executable."
-            )
-            continue
-        except Exception as exc:  # defensive: never let the handler crash
-            log.exception("Unexpected error running music-dl")
-            await message.reply_text(f"{prefix}❌ Unexpected error: {exc}")
-            continue
-
-        newest = _newest_music_file(started)
-        reply = summarize_result(rc, out, err, newest)
+    for i, (kind, value) in enumerate(jobs, start=1):
+        prefix = f"[{i}/{len(jobs)}] " if len(jobs) > 1 else ""
+        reply = await process_job(kind, value)
         await message.reply_text((prefix + reply)[:MAX_TG_MESSAGE])
 
 

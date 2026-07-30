@@ -13,11 +13,29 @@ Terminal). Copy-paste them one block at a time. Anything in ALL-CAPS like
 
 - `music_bot.py` — the bot
 - `com.user.musicbot.plist` — the launchd config that keeps it running
-- `requirements.txt` — the one Python dependency
+- `requirements.txt` — the Python dependencies (includes spotdl for Spotify)
+- `.env.example` — template for your secrets/config (copy to `.env`)
 - `SETUP.md` — this guide
 
-Throughout, I'll assume you put everything in `~/musicbot`. Adjust if you prefer
-another folder.
+Throughout, I'll assume the repo lives at `/Users/orlandocedeno/Music-Download-Bot`
+and the bot at `/Users/orlandocedeno/Music-Download-Bot/DJ/musicbot`.
+
+## Secrets live in a `.env` file (not in the plist, not in git)
+
+Your bot token and allowlist are read from a `DJ/musicbot/.env` file, which is
+**gitignored** so it never gets committed. Create it once by copying the
+template and filling in your values:
+
+```bash
+cd /Users/orlandocedeno/Music-Download-Bot/DJ/musicbot
+cp .env.example .env
+open -e .env        # fill in TELEGRAM_BOT_TOKEN and ALLOWED_USER_IDS
+```
+
+The `.env` keys are: `TELEGRAM_BOT_TOKEN`, `ALLOWED_USER_IDS`, `MUSIC_DL`,
+`MUSIC_DIR`, `SPOTDL`. The plist only sets `PATH` now — everything else comes
+from `.env`. After editing `.env`, reload the LaunchAgent (see step 8) for
+changes to take effect.
 
 ---
 
@@ -55,20 +73,37 @@ Open **Terminal** and run:
 
 ```bash
 # Make a home for the bot and copy in the files.
-mkdir -p ~/musicbot
-# Copy the four files from wherever you saved them into ~/musicbot, e.g.:
+mkdir -p /Users/orlandocedeno/Music-Download-Bot/DJ/musicbot
+# Copy the four files from wherever you saved them into /Users/orlandocedeno/Music-Download-Bot/DJ/musicbot, e.g.:
 #   cp ~/Downloads/music_bot.py ~/Downloads/requirements.txt \
-#      ~/Downloads/com.user.musicbot.plist ~/Downloads/SETUP.md ~/musicbot/
-cd ~/musicbot
+#      ~/Downloads/com.user.musicbot.plist ~/Downloads/SETUP.md /Users/orlandocedeno/Music-Download-Bot/DJ/musicbot/
+cd /Users/orlandocedeno/Music-Download-Bot/DJ/musicbot
 
 # Create a dedicated virtual environment (keeps deps isolated and avoids the
 # "externally-managed-environment" / pip errors you get installing globally).
 python3 -m venv venv
 
-# Install the bot's dependency into the venv.
+# Install the bot's dependencies into the venv (includes spotdl for Spotify).
 ./venv/bin/python3 -m pip install --upgrade pip
 ./venv/bin/python3 -m pip install -r requirements.txt
 ```
+
+**Link support notes:**
+
+- *YouTube* and *SoundCloud* links work with no extra setup — they're handled by
+  the yt-dlp inside your `music-dl` script. Just paste the link.
+- *Spotify* links use **spotdl** (installed by the line above). spotdl reads the
+  track/album/playlist info and downloads the matching audio from YouTube —
+  Spotify's own audio is DRM-protected and can't be downloaded directly. No
+  Spotify account or API key is needed. If spotdl fails to install on Python
+  3.14, the rest of the bot still works; you can retry later with
+  `./venv/bin/python3 -m pip install spotdl`.
+- *Shazam* links need nothing extra — the bot resolves them to a song name and
+  searches YouTube.
+
+You'll get the *YouTube version* of Spotify/Shazam tracks (not the original
+master), and matching is occasionally imperfect (wrong version/remix). Spotify
+playlists expand to many tracks and are downloaded one by one.
 
 Confirm the download tools your `music-dl` needs are installed and on PATH:
 
@@ -83,7 +118,7 @@ which yt-dlp ffmpeg
 Make sure `music-dl` itself is executable:
 
 ```bash
-chmod +x /Users/orlandocedeno/DJ/musicbot   # <-- use your real path
+chmod +x /Users/YOURNAME/music/music-dl   # <-- use your real path
 ```
 
 ---
@@ -93,14 +128,14 @@ chmod +x /Users/orlandocedeno/DJ/musicbot   # <-- use your real path
 Open the plist in a text editor:
 
 ```bash
-open -e ~/musicbot/com.user.musicbot.plist
+open -e /Users/orlandocedeno/Music-Download-Bot/DJ/musicbot/com.user.musicbot.plist
 ```
 
 Replace every **EDIT-ME** value. In particular:
 
 | Placeholder | Replace with |
 |---|---|
-| `/Users/YOURNAME/musicbot/venv/bin/python3` | your venv python (run `echo ~/musicbot/venv/bin/python3` to get the full path — no `~`) |
+| `/Users/YOURNAME/musicbot/venv/bin/python3` | your venv python (run `echo /Users/orlandocedeno/Music-Download-Bot/DJ/musicbot/venv/bin/python3` to get the full path — no `~`) |
 | `/Users/YOURNAME/musicbot/music_bot.py` | full path to `music_bot.py` |
 | `TELEGRAM_BOT_TOKEN` value | your BotFather token from step 1 |
 | `ALLOWED_USER_IDS` value | your ID(s) from step 2, comma-separated, e.g. `111111111,222222222` |
@@ -123,7 +158,7 @@ launchd starts with a minimal environment.
 ```bash
 # Copy the plist into the LaunchAgents folder (create it if missing).
 mkdir -p ~/Library/LaunchAgents
-cp ~/musicbot/com.user.musicbot.plist ~/Library/LaunchAgents/
+cp /Users/orlandocedeno/Music-Download-Bot/DJ/musicbot/com.user.musicbot.plist ~/Library/LaunchAgents/
 
 # Load it (starts the bot now and on every login).
 launchctl load ~/Library/LaunchAgents/com.user.musicbot.plist
@@ -186,7 +221,7 @@ effect:
 
 ```bash
 # If you edited the plist, copy the new version over first:
-cp ~/musicbot/com.user.musicbot.plist ~/Library/LaunchAgents/
+cp /Users/orlandocedeno/Music-Download-Bot/DJ/musicbot/com.user.musicbot.plist ~/Library/LaunchAgents/
 
 # Unload then load (works on all macOS versions):
 launchctl unload ~/Library/LaunchAgents/com.user.musicbot.plist
@@ -202,7 +237,7 @@ launchctl unload ~/Library/LaunchAgents/com.user.musicbot.plist
 To **update the Python dependency** later:
 
 ```bash
-~/musicbot/venv/bin/python3 -m pip install --upgrade -r ~/musicbot/requirements.txt
+/Users/orlandocedeno/Music-Download-Bot/DJ/musicbot/venv/bin/python3 -m pip install --upgrade -r /Users/orlandocedeno/Music-Download-Bot/DJ/musicbot/requirements.txt
 # then unload/load as above
 ```
 

@@ -1,3 +1,19 @@
 # Telegram bot dependency. v21+ is async and is what music_bot.py targets.
 # Pinned to a known-good 21.x release for reproducible installs.
+#
+# Python 3.14 note: on 3.14, asyncio.get_event_loop() no longer auto-creates a
+# loop, which PTB 21.6's run_polling() expects. music_bot.py includes a small
+# event-loop shim (in main(), just before run_polling) that fixes this, so we
+# KEEP the 21.6 pin. Do NOT bump to a newer PTB just to chase 3.14 support —
+# newer releases may pull wheels that don't yet build/install cleanly on 3.14.
 python-telegram-bot==21.6
+
+# Spotify support: spotdl reads a Spotify link's metadata and downloads the
+# matching audio from YouTube (Spotify's own audio is DRM-protected). Only
+# needed if you paste Spotify links; the bot degrades gracefully without it.
+# Loosely pinned so pip can pick a build compatible with your Python version.
+spotdl>=4.5,<5
+
+# NOTE: SoundCloud and Shazam need NO extra packages — SoundCloud is handled by
+# the yt-dlp inside your music-dl script, and Shazam links are resolved with the
+# Python standard library (urllib).

@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+#
+# refresh-library - give every MP3 in Music/ embedded cover art, real ID3 tags,
+# and better audio where a genuine match exists.
+#
+# Your originals are NEVER modified. Results go to Music-refreshed/.
+#
+# For each file it searches YouTube AND SoundCloud, then picks a candidate whose
+# DURATION matches the original. That duration check is what stops a bounce edit
+# or a club remix from being silently replaced by the radio version.
+#
+#   match found  -> download it fresh: 320 kbps, cover art, artist/title tags
+#   no match     -> keep YOUR audio untouched, just embed the best cover art found
+#
+# So nothing is ever lost - worst case a track keeps the exact audio it has now
+# and gains an image.
+#
+#   ./refresh-library            dry run - show the search query for each file
+#   ./refresh-library --go       do it, writing into Music-refreshed/
+#   ./refresh-library --report   re-print the table from the last run
+#
+set -o pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRC="$SCRIPT_DIR/Music"
+DEST="$SCRIPT_DIR/Music-refreshed"
+WORK="$DEST/.work"
+ARCHIVE="$DEST/.archive.txt"
+REPORT="$SCRIPT_DIR/refresh-report.tsv"
+TOLERANCE=4          # seconds of drift still considered the same recording
+
+if [ -t 1 ]; then
+  B=$'\033[1m'; DIM=$'\033[2m'; GRN=$'\033[32m'; YEL=$'\033[33m'
+  RED=$'\033[31m'; CYN=$'\033[36m'; N=$'\033[0m'
+else
+  B=""; DIM=""; GRN=""; YEL=""; RED=""; CYN=""; N=""
+fi
+
+MODE="dry"
+case "${1:-}" in
+  --go)      MODE="go" ;;
+  --report)  MODE="report" ;;
+  -h|--help) awk 'NR>1 && /^#/ { sub(/^# ?/,""); print; next } NR>1 { exit }' "${BASH_SOURCE[0]}"; exit 0 ;;
+  "")        MODE="dry" ;;
+  *)         echo "unknown option: $1" >&2; exit 1 ;;
+esac
+# Optional second argument limits the run to originals matching this substring,
+# so a single track can be redone without touching the other 40.
+FILTER="${2:-}"
+
+dur() { ffprobe -v error -show_entries format=duration -of csv=p=0 "$1" 2>/dev/null | cut -d. -f1; }
+has_art() { [ -n "$(ffprobe -v error -select_streams v -show_entries stream=codec_name -of csv=p=0 "$1" 2>/dev/null | head -1)" ]; }
+
+# Filename -> sane search query: drop the extension, ripper-site noise, and the
+# "(Official Video)" style tags that only confuse search.
+to_query() {
+  printf '%s' "$1" \
+    | sed -e 's/\.mp3$//' \
+          -e 's/_/ /g' \
+          -e 's/[[:space:]]*-*[[:space:]]*KLICKAUD//Ig' \
+          -e 's/[[:space:]]*-*[[:space:]]*tco//Ig' \
+          -e 's/[[:space:]]*-[[:space:]]*YouTube to MP3//Ig' \
+          -e 's/([^)]*[Ll]yric[^)]*)//g' \
+          -e 's/([^)]*[Ll]etra[^)]*)//g' \
+          -e 's/([^)]*[Oo]fficial[^)]*)//g' \
+          -e 's/([^)]*[Oo]ficial[^)]*)//g' \
+          -e 's/([^)]*[Aa]udio[^)]*)//g' \
+          -e 's/([^)]*[Vv]ideo[^)]*)//g' \
+          -e 's/[[:space:]]*Official Music Video//Ig' \
+          -e 's/[[:space:]]*Official Video//Ig' \
+          -e 's/[[:space:]]*Official Audio//Ig' \
+          -e 's/[[:space:]]*Lyric Video//Ig' \
+          -e 's/[[:space:]]*Lyrics//Ig' \
+          -e 's/[[:space:]]*Full Song//Ig' \
+          -e 's/\([a-z]\)\([A-Z]\)/\1 \2/g' \
+          -e 's/[[:space:]]\{2,\}/ /g' \
+          -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+# ------------------------------------------------------------------ report only
+if [ "$MODE" = "report" ]; then
+  [ -f "$REPORT" ] || { echo "No report yet - run ./refresh-library --go first."; exit 1; }
+  column -t -s $'\t' "$REPORT"
+  exit 0
+fi
+
+# ------------------------------------------------------------------ dry run
+if [ "$MODE" = "dry" ]; then
+  echo "${B}Dry run${N} - these are the searches that would run. Nothing is downloaded."
+  echo "${DIM}Re-run with --go to actually fetch.${N}"
+  echo
+  for f in "$SRC"/*.mp3; do
+    base="$(basename "$f")"
+    if has_art "$f"; then
+      printf "%-52.52s %s\n" "$base" "${DIM}(already has art - skipping)${N}"
+    else
+      printf "%-52.52s -> %s\n" "$base" "$(to_query "$base")"
+    fi
+  done
+  exit 0
+fi
+
+# ------------------------------------------------------------------ helpers
+# Print tab-separated "duration<TAB>url<TAB>title" candidate lines.
+# Tab is the delimiter and the URL comes before the title on purpose: YouTube
+# titles routinely contain "|" and other punctuation, which silently shifted the
+# fields and fed a fragment of a title to the downloader as if it were a URL.
+TAB=$'\t'
+candidates() {
+  yt-dlp --ignore-config --no-warnings --flat-playlist \
+         --print "%(duration)s${TAB}%(webpage_url)s${TAB}%(title)s" "$1" 2>/dev/null
+}
+
+# Pick the candidate closest in duration to $1, within TOLERANCE. Lyric videos
+# win ties. Prints "url|title" or nothing.
+pick_match() {
+  local target="$1" q="$2"
+  awk -F'\t' -v target="$target" -v tol="$TOLERANCE" -v q="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" '
+    # Versions that are the wrong recording even when the runtime lines up.
+    # Only rejected if the original filename did not ask for them.
+    function unwanted(t,   bad) {
+      bad = "live|cover|karaoke|instrumental|acapella|a cappella|sped up|speed up|slowed|nightcore|reverb|8d audio|bass boosted|tutorial|reaction|review"
+      n = split(bad, arr, "|")
+      for (i = 1; i <= n; i++)
+        if (index(t, arr[i]) && !index(q, arr[i])) return 1
+      return 0
+    }
+    {
+      d = $1 + 0
+      if (d <= 0) next
+      diff = d - target; if (diff < 0) diff = -diff
+      if (diff > tol) next
+      t = tolower($3)
+      if (unwanted(t)) next
+      if ($2 !~ /^https?:\/\//) next            # field must really be a URL
+      score = diff * 10
+      if (t ~ /lyric/) score -= 5               # nudge lyric videos ahead
+      if (best == "" || score < bestscore) { bestscore = score; best = $2 "\t" $3 }
+    }
+    END { if (best != "") print best }
+  '
+}
+
+embed_art() {
+  # embed_art <source-mp3> <image> <out-mp3> [artist] [title]
+  local src="$1" img="$2" out="$3" artist="${4:-}" title="${5:-}"
+  local meta=()
+  [ -n "$artist" ] && meta+=(-metadata "artist=$artist")
+  [ -n "$title" ]  && meta+=(-metadata "title=$title")
+  ffmpeg -y -loglevel error -i "$src" -i "$img" \
+    -map 0:a -map 1:v -c:a copy -c:v mjpeg -id3v2_version 3 \
+    -metadata:s:v title="Album cover" -metadata:s:v comment="Cover (front)" \
+    "${meta[@]}" "$out" 2>/dev/null
+}
+
+# ------------------------------------------------------------------ real run
+mkdir -p "$DEST" "$WORK"
+# A filtered re-run must not wipe the rows for files it isn't touching.
+if [ -n "$FILTER" ] && [ -f "$REPORT" ]; then
+  grep -v "$TAB$FILTER" "$REPORT" > "$REPORT.keep" 2>/dev/null
+  mv "$REPORT.keep" "$REPORT"
+else
+  printf 'RESULT\tFILE\tOLD\tNEW\tSOURCE\tDETAIL\n' > "$REPORT"
+fi
+
+total=0; upgraded=0; arted=0; failed=0; skipped=0
+
+for f in "$SRC"/*.mp3; do
+  base="$(basename "$f")"
+  name="${base%.mp3}"
+
+  if [ -n "$FILTER" ]; then
+    case "$base" in *"$FILTER"*) ;; *) continue ;; esac
+  fi
+  total=$((total + 1))
+
+  if has_art "$f"; then
+    echo "${DIM}skip  $base (already has art)${N}"
+    printf 'SKIP\t%s\t-\t-\t-\talready had art\n' "$base" >> "$REPORT"
+    skipped=$((skipped + 1))
+    continue
+  fi
+
+  query="$(to_query "$base")"
+  old="$(dur "$f")"
+  echo "${B}${CYN}==>${N} ${B}$name${N} ${DIM}(${old}s)${N}"
+
+  # --- gather candidates from both platforms -------------------------------
+  all="$(candidates "ytsearch10:$query lyrics"; candidates "ytsearch10:$query"; candidates "scsearch10:$query")"
+  hit="$(printf '%s\n' "$all" | pick_match "$old" "$query")"
+
+  if [ -n "$hit" ]; then
+    # ---- duration matched: re-download properly ---------------------------
+    url="${hit%%$TAB*}"
+    ctitle="${hit#*$TAB}"
+    case "$url" in
+      *soundcloud*) src="SoundCloud" ;;
+      *)            src="YouTube" ;;
+    esac
+    echo "${DIM}    match: $ctitle${N}"
+
+    before="$(ls "$DEST" 2>/dev/null)"
+    MUSIC_DIR="$DEST" ARCHIVE="$ARCHIVE" "$SCRIPT_DIR/music-dl" "$url" >/dev/null 2>&1
+    after="$(ls "$DEST" 2>/dev/null)"
+    new="$(comm -13 <(printf '%s\n' "$before" | sort) <(printf '%s\n' "$after" | sort) | grep '\.mp3$' | head -1)"
+
+    if [ -n "$new" ] && has_art "$DEST/$new"; then
+      # Re-verify against the FILE we actually got, not the duration the search
+      # advertised. Belt and braces: catches a bad URL, a redirect, or a search
+      # result whose metadata lied.
+      newdur="$(dur "$DEST/$new")"
+      drift=$(( ${newdur:-0} - ${old:-0} )); drift=${drift#-}
+      if [ "$drift" -le "$TOLERANCE" ]; then
+        echo "${GRN}    UPGRADED  $new  [$src]${N}"
+        printf 'UPGRADED\t%s\t%ss\t%ss\t%s\t%s\n' "$base" "$old" "$newdur" "$src" "$ctitle" >> "$REPORT"
+        upgraded=$((upgraded + 1))
+        continue
+      fi
+      echo "${YEL}    downloaded file is ${newdur}s, expected ~${old}s - discarding${N}"
+      rm -f "$DEST/$new"
+    else
+      echo "${YEL}    download failed${N}"
+    fi
+    echo "${YEL}    falling back to keeping your audio${N}"
+  fi
+
+  # --- no usable match: keep the original audio, just add art --------------
+  # Take the artwork from the best-titled candidate even though its audio is a
+  # different cut - the cover is still the right song.
+  art_url="$(printf '%s\n' "$all" | awk -F'\t' '$2 ~ /^https?:\/\// { print $2; exit }')"
+  rm -f "$WORK"/cover.*
+  if [ -n "$art_url" ]; then
+    yt-dlp --ignore-config --no-warnings --skip-download --write-thumbnail \
+           --convert-thumbnails jpg -o "$WORK/cover.%(ext)s" -- "$art_url" >/dev/null 2>&1
+  fi
+
+  if [ -f "$WORK/cover.jpg" ]; then
+    # tag artist/title from "Artist - Song" in the filename when it's there
+    if printf '%s' "$name" | grep -q ' - '; then
+      a="$(printf '%s' "$name" | sed -e 's/ - .*//')"
+      t="$(printf '%s' "$name" | sed -e 's/^[^-]* - //')"
+    else
+      a=""; t="$name"
+    fi
+    if embed_art "$f" "$WORK/cover.jpg" "$DEST/$base" "$a" "$t" && [ -s "$DEST/$base" ]; then
+      echo "${YEL}    KEPT your audio + added art${N}"
+      printf 'ART-ONLY\t%s\t%ss\t%ss\t-\tno duration match; original audio kept\n' \
+        "$base" "$old" "$old" >> "$REPORT"
+      arted=$((arted + 1))
+      continue
+    fi
+  fi
+
+  # --- couldn't even find art: copy the original through untouched ---------
+  cp "$f" "$DEST/$base"
+  echo "${RED}    no match and no art found - copied your original as-is${N}"
+  printf 'UNCHANGED\t%s\t%ss\t%ss\t-\tno match, no art found\n' "$base" "$old" "$old" >> "$REPORT"
+  failed=$((failed + 1))
+done
+
+rm -rf "$WORK" "$DEST/.tmp"
+
+echo
+echo "${B}Done.${N} $total files"
+echo "  ${GRN}$upgraded upgraded${N} (new 320k audio + art)"
+echo "  ${YEL}$arted kept your audio${N} (art embedded, audio untouched)"
+echo "  ${RED}$failed unchanged${N} (no match, no art)"
+echo "  ${DIM}$skipped skipped${N} (already had art)"
+echo
+echo "New library:  $DEST"
+echo "Originals:    ${B}untouched${N} in $SRC"
+echo "Full report:  ./refresh-library --report"

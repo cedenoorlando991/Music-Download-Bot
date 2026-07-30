@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd LaunchAgent for the Telegram music bot.
+
+  SECRETS LIVE IN .env, NOT HERE. This file is safe to commit: it contains no
+  token and no user IDs. The bot reads TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS,
+  MUSIC_DL, MUSIC_DIR and SPOTDL from DJ/musicbot/.env at startup (see
+  _load_dotenv in music_bot.py). Copy .env.example to .env and fill it in.
+
+  Paths below assume the repo is checked out at:
+    /Users/orlandocedeno/Music-Download-Bot
+  If your username or checkout location differs, edit the paths accordingly.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.musicbot</string>
+
+    <!-- venv python running music_bot.py -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/orlandocedeno/Music-Download-Bot/DJ/musicbot/venv/bin/python3</string>
+        <string>/Users/orlandocedeno/Music-Download-Bot/DJ/musicbot/music_bot.py</string>
+    </array>
+
+    <!-- Only PATH here (so music-dl/spotdl find yt-dlp + ffmpeg). All secrets
+         and paths come from .env. Covers Apple-Silicon and Intel Homebrew. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Run from the bot folder so .env (and relative paths) resolve. -->
+    <key>WorkingDirectory</key>
+    <string>/Users/orlandocedeno/Music-Download-Bot/DJ/musicbot</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/orlandocedeno/Library/Logs/musicbot.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/orlandocedeno/Library/Logs/musicbot.log</string>
+</dict>
+</plist>

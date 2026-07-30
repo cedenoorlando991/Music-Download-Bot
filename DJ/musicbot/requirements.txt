@@ -1,0 +1,3 @@
+# Telegram bot dependency. v21+ is async and is what music_bot.py targets.
+# Pinned to a known-good 21.x release for reproducible installs.
+python-telegram-bot==21.6

@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+#
+# music-dl - download YouTube (and most other sites) audio as MP3 into ./Music
+#
+#   ./music-dl                     interactive: paste a URL, hit enter, repeat
+#   ./music-dl <url> [url ...]     one-shot
+#   ./music-dl "artist song name"  searches YouTube for a LYRIC video of it
+#
+# Flags:
+#   --any          search normally instead of preferring lyric videos
+#   --raw          keep the original video title verbatim (skip "(Lyrics)" cleanup)
+#   --playlist     download the whole playlist if the URL points into one
+#   --quality N    MP3 bitrate in kbps, default 320
+#   -h, --help     show this
+#
+# Env overrides:
+#   MUSIC_DIR=/some/path ./music-dl ...     write somewhere other than ./Music
+#
+set -o pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MUSIC_DIR="${MUSIC_DIR:-$SCRIPT_DIR/Music}"
+ARCHIVE="${ARCHIVE:-$SCRIPT_DIR/.download-archive.txt}"
+
+CLEAN=1
+NO_PLAYLIST=1
+QUALITY=320
+LYRICS=1
+
+if [ -t 1 ]; then
+  B=$'\033[1m'; DIM=$'\033[2m'; GRN=$'\033[32m'; YEL=$'\033[33m'
+  RED=$'\033[31m'; CYN=$'\033[36m'; N=$'\033[0m'
+else
+  B=""; DIM=""; GRN=""; YEL=""; RED=""; CYN=""; N=""
+fi
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '%s* %s%s\n' "$GRN" "$*" "$N"; }
+note() { printf '%s  %s%s\n' "$YEL" "$*" "$N"; }
+err()  { printf '%sx %s%s\n' "$RED" "$*" "$N" >&2; }
+# print the comment header above, stopping at the first line of real code
+usage() { awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "${BASH_SOURCE[0]}"; }
+
+# ---------------------------------------------------------------- deps
+missing=""
+command -v yt-dlp >/dev/null 2>&1 || missing="$missing yt-dlp"
+command -v ffmpeg >/dev/null 2>&1 || missing="$missing ffmpeg"
+if [ -n "$missing" ]; then
+  err "Missing:$missing"
+  say "Install with:  ${B}brew install$missing${N}"
+  exit 1
+fi
+
+# ---------------------------------------------------------------- args
+URLS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --raw)      CLEAN=0 ;;
+    --any)      LYRICS=0 ;;
+    --playlist) NO_PLAYLIST=0 ;;
+    --quality)  QUALITY="${2:-320}"; shift ;;
+    -h|--help)  usage; exit 0 ;;
+    --)         shift; while [ $# -gt 0 ]; do URLS+=("$1"); shift; done; break ;;
+    -*)         err "Unknown flag: $1"; usage; exit 1 ;;
+    *)          URLS+=("$1") ;;
+  esac
+  shift
+done
+
+mkdir -p "$MUSIC_DIR"
+
+# ---------------------------------------------------------------- yt-dlp
+# Noise words stripped from titles when CLEAN=1.
+JUNK='lyric|lyrics|official|video|audio|visuali[sz]er|hd|hq|4k|full song|with lyrics|letra|explicit|clean version|color coded|mv'
+
+build_args() {
+  ARGS=(
+    --ignore-config
+    --extract-audio
+    --audio-format mp3
+    --audio-quality "${QUALITY}K"
+    --format "bestaudio/best"
+    --embed-thumbnail          # cover art from the video thumbnail
+    --embed-metadata           # artist/title/date into ID3 tags
+    --convert-thumbnails jpg
+    --download-archive "$ARCHIVE"   # never grab the same video twice
+    --no-overwrites
+    --paths "$MUSIC_DIR"
+    --paths "temp:$MUSIC_DIR/.tmp"
+    --output "%(artist&{} - |)s%(title)s.%(ext)s"
+    --windows-filenames        # keep names portable: no / : ? * in filenames
+    --trim-filenames 180
+    --newline
+    --retries 5
+    --fragment-retries 10
+    --no-warnings
+  )
+
+  [ "$NO_PLAYLIST" = 1 ] && ARGS+=(--no-playlist)
+
+  if [ "$CLEAN" = 1 ]; then
+    ARGS+=(
+      # "Song (Official Lyric Video)" -> "Song"
+      --replace-in-metadata "title" "(?i)\s*[\(\[][^\)\]]*($JUNK)[^\)\]]*[\)\]]\s*" " "
+      # trailing unbracketed tag: "Song - Official Audio" -> "Song"
+      --replace-in-metadata "title" "(?i)\s*[-|]\s*[^-|]*($JUNK)[^-|]*$" ""
+      --replace-in-metadata "title" "\s{2,}" " "
+      --replace-in-metadata "title" "^\s+|\s+$" ""
+      # channel noise that would otherwise become the artist tag
+      --replace-in-metadata "uploader,artist,creator" "\s*-\s*Topic$" ""
+      --replace-in-metadata "uploader,artist,creator" "(?<=\w)VEVO$" ""
+    )
+  fi
+
+  # If the cleaned title reads "Artist - Song", split it into real ID3 fields.
+  # Non-matching titles are left alone.
+  ARGS+=(--parse-metadata "title:(?P<artist>[^-]+?) - (?P<title>.+)")
+
+  ARGS+=(
+    # Artist tag falls back to the channel name when the title had no "-".
+    # (meta_artist only touches the ID3 tag, so the filename stays clean.)
+    --parse-metadata "%(artist,uploader)s:(?P<meta_artist>.+)"
+    # Don't dump the entire YouTube description into the file's tags.
+    --parse-metadata ":(?P<meta_comment>)"
+    --parse-metadata ":(?P<meta_description>)"
+    --parse-metadata ":(?P<meta_synopsis>)"
+    --parse-metadata ":(?P<meta_purl>)"
+  )
+}
+
+fetch() {
+  input="$1"
+  # trim whitespace and stray quotes picked up while copying
+  input="$(printf '%s' "$input" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^["'"'"']//' -e 's/["'"'"']$//')"
+  [ -z "$input" ] && return 0
+
+  case "$input" in
+    http://*|https://*)
+      # A pasted URL is downloaded verbatim -- never silently swapped for a
+      # different video, even if it isn't the lyric version.
+      target="$input"
+      say "${DIM}-> $input${N}"
+      ;;
+    *)
+      if [ "$LYRICS" = 1 ]; then
+        say "${DIM}-> searching YouTube for a lyric video of \"$input\"${N}"
+        # Scan the top results and take the first whose title says "lyric".
+        target="$(yt-dlp --ignore-config --no-warnings --flat-playlist \
+                    --match-filter "title ~= '(?i)lyric'" \
+                    --print "%(webpage_url)s" \
+                    "ytsearch15:$input lyrics" 2>/dev/null | head -1)"
+        if [ -n "$target" ]; then
+          say "${DIM}   found $target${N}"
+        else
+          note "no lyric video found, using the top regular result"
+          target="ytsearch1:$input"
+        fi
+      else
+        target="ytsearch1:$input"
+        say "${DIM}-> searching YouTube for \"$input\"${N}"
+      fi
+      ;;
+  esac
+
+  build_args
+  log="$(mktemp -t musicdl)"
+  yt-dlp "${ARGS[@]}" -- "$target" 2>&1 | tee "$log"
+  status=$?
+
+  if [ "$status" -ne 0 ]; then
+    err "failed: $input"
+    rm -f "$log"
+    return 1
+  fi
+
+  if grep -q "has already been recorded in the archive" "$log"; then
+    ok "already in your library, skipped"
+  else
+    # report the final filename rather than a generic success line
+    saved="$(grep '^\[MoveFiles\] Moving file' "$log" | sed -e 's/.* to "//' -e 's/"$//' | tail -1)"
+    if [ -n "$saved" ]; then
+      ok "$(basename "$saved")"
+    else
+      ok "saved to $MUSIC_DIR"
+    fi
+  fi
+  rm -f "$log"
+  return 0
+}
+
+cleanup_tmp() { rm -rf "$MUSIC_DIR/.tmp" 2>/dev/null; }
+trap cleanup_tmp EXIT
+
+# ---------------------------------------------------------------- one-shot
+if [ ${#URLS[@]} -gt 0 ]; then
+  fails=0
+  for u in "${URLS[@]}"; do fetch "$u" || fails=$((fails + 1)); done
+  [ "$fails" -gt 0 ] && exit 1
+  exit 0
+fi
+
+# ---------------------------------------------------------------- interactive
+say ""
+say "${B}${CYN}music-dl${N} ${DIM}- YouTube to MP3, saved in ${MUSIC_DIR}${N}"
+say "${DIM}Paste a URL and press enter. Or type a song name to search for it.${N}"
+say "${DIM}Commands: q = quit, ls = recent downloads, open = open the folder${N}"
+say ""
+
+while true; do
+  if ! IFS= read -r -e -p "$(printf '%surl>%s ' "$B$CYN" "$N")" line; then
+    say ""; break
+  fi
+  cmd="$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "$cmd" in
+    q|quit|exit) break ;;
+    "")          continue ;;
+    open)        open "$MUSIC_DIR"; continue ;;
+    ls)          ls -t "$MUSIC_DIR" | head -10; continue ;;
+    help|\?)     usage; continue ;;
+  esac
+  # several URLs pasted on one line all get downloaded
+  case "$line" in
+    http*\ http*) for p in $line; do fetch "$p"; done ;;
+    *)            fetch "$line" ;;
+  esac
+  say ""
+done
+
+say "${DIM}bye${N}"

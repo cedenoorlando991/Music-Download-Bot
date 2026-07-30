@@ -1,0 +1,23 @@
+# --- Secrets / local config (NEVER commit) ---
+.env
+*.env
+!.env.example
+
+# --- Python virtualenv & caches ---
+DJ/musicbot/venv/
+__pycache__/
+*.pyc
+
+# --- Backups & editor/OS cruft ---
+*.bak
+.DS_Store
+
+# --- Logs ---
+*.log
+
+# --- Downloaded music & personal library data ---
+/DJ/Music
+DJ/.download-archive.txt
+
+# --- Feature staging files (consumed by the commit script) ---
+*.new

@@ -15,9 +15,14 @@ __pycache__/
 # --- Logs ---
 *.log
 
+# --- Bot daily dependency-check stamp ---
+DJ/musicbot/.deps-checked
+
 # --- Downloaded music & personal library data ---
 /DJ/Music
 DJ/.download-archive.txt
 
 # --- Feature staging files (consumed by the commit script) ---
 *.new
+/DJ/claire\!
+/DJ

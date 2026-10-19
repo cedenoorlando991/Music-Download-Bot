@@ -168,6 +168,14 @@ fetch() {
 
   if [ "$status" -ne 0 ]; then
     err "failed: $input"
+    # yt-dlp's real reason is in the tee'd log. Copy ERROR lines to stderr
+    # so callers that only read stderr (the Telegram bot) see why it failed.
+    if [ -f "$log" ]; then
+      grep '^ERROR:' "$log" >&2 || true
+      if grep -q 'HTTP Error 403' "$log"; then
+        err "YouTube refused the audio (HTTP 403). Usually fixed by: brew upgrade yt-dlp"
+      fi
+    fi
     rm -f "$log"
     return 1
   fi

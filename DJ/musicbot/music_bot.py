@@ -24,10 +24,13 @@ Environment variables
                                   can use the bot except via /id (which is
                                   always allowed so you can discover your ID).
   MUSIC_DL            (required)  Absolute path to your music-dl script.
-  MUSIC_DIR           (optional)  Absolute path to the Music output folder.
-                                  Used to report saved filenames, to detect the
-                                  newest file after a download, and as the
-                                  destination for Spotify downloads via spotdl.
+  MUSIC_DIR           (optional)  Default Music output folder (owner library).
+  DALIZAS_MUSIC_DIR   (optional)  Separate library for DALIZAS_USER_ID.
+  DALIZAS_USER_ID     (optional)  Telegram user ID whose downloads go to
+                                  DALIZAS_MUSIC_DIR instead of MUSIC_DIR.
+  CLAIRE_MUSIC_DIR    (optional)  Separate library for CLAIRE_USER_ID.
+  CLAIRE_USER_ID      (optional)  Telegram user ID whose downloads go to
+                                  CLAIRE_MUSIC_DIR instead of MUSIC_DIR.
   SPOTDL              (optional)  Absolute path to the spotdl executable. If
                                   unset, we look next to this Python (the venv's
                                   bin/spotdl) and then fall back to PATH.
@@ -41,6 +44,11 @@ Any link (or bare song name) you send is routed automatically:
     downloaded). spotdl must be installed in the venv (pip install spotdl).
   * Shazam links -> we resolve the link to "artist - title" and then run a
     YouTube search through music-dl.
+
+On the first download of each calendar day the bot upgrades Homebrew yt-dlp
+and the venv's yt-dlp + spotdl (YouTube breaks old extractors often). Later
+downloads that day skip the check. Stamp file: .deps-checked next to this
+script.
 """
 
 import asyncio
@@ -49,9 +57,11 @@ import logging
 import os
 import re
 import shlex
+import subprocess
 import sys
 import time
 import urllib.request
+from datetime import date
 from pathlib import Path
 
 from telegram import Update
@@ -99,6 +109,8 @@ _load_dotenv()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 MUSIC_DL = os.environ.get("MUSIC_DL", "").strip()
 MUSIC_DIR = os.environ.get("MUSIC_DIR", "").strip()
+DALIZAS_MUSIC_DIR = os.environ.get("DALIZAS_MUSIC_DIR", "").strip()
+CLAIRE_MUSIC_DIR = os.environ.get("CLAIRE_MUSIC_DIR", "").strip()
 
 # How long (seconds) to let a single music-dl invocation run before giving up.
 # A long song / slow network can take a while, so this is generous.
@@ -125,14 +137,60 @@ SPOTDL = _discover_spotdl()
 
 def music_output_dir() -> str:
     """
-    Where downloaded audio should live. Uses MUSIC_DIR if set, else the ./Music
-    folder next to the music-dl script (matching music-dl's own default).
+    Default library (owner). Uses MUSIC_DIR if set, else the ./Music folder
+    next to the music-dl script (matching music-dl's own default).
     """
     if MUSIC_DIR:
         return MUSIC_DIR
     if MUSIC_DL:
         return str(Path(MUSIC_DL).resolve().parent / "Music")
     return os.getcwd()
+
+
+def _parse_one_id(raw: str) -> int | None:
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        logging.warning("Ignoring non-numeric per-user library ID: %r", raw)
+        return None
+
+
+DALIZAS_USER_ID = _parse_one_id(os.environ.get("DALIZAS_USER_ID", ""))
+CLAIRE_USER_ID = _parse_one_id(os.environ.get("CLAIRE_USER_ID", ""))
+
+
+def music_dir_for_user(user_id: int | None) -> str:
+    """Pick the library folder for this Telegram user."""
+    if user_id is not None:
+        if user_id == DALIZAS_USER_ID and DALIZAS_MUSIC_DIR:
+            return DALIZAS_MUSIC_DIR
+        if user_id == CLAIRE_USER_ID and CLAIRE_MUSIC_DIR:
+            return CLAIRE_MUSIC_DIR
+    return music_output_dir()
+
+
+def archive_for_music_dir(music_dir: str) -> str:
+    """
+    Per-library yt-dlp archive so two users downloading the same video don't
+    skip each other. The owner keeps the historical file next to music-dl.
+    """
+    default = (
+        str(Path(MUSIC_DL).resolve().parent / ".download-archive.txt")
+        if MUSIC_DL
+        else str(Path(music_dir) / ".download-archive.txt")
+    )
+    for user_dir in (DALIZAS_MUSIC_DIR, CLAIRE_MUSIC_DIR):
+        if not user_dir:
+            continue
+        try:
+            if Path(music_dir).resolve() == Path(user_dir).resolve():
+                return str(Path(user_dir) / ".download-archive.txt")
+        except OSError:
+            pass
+    return default
 
 # Telegram messages cap out at 4096 chars; keep our replies safely under that.
 MAX_TG_MESSAGE = 3500
@@ -188,45 +246,97 @@ async def deny(update: Update) -> None:
 # music-dl invocation
 # --------------------------------------------------------------------------- #
 
-def _newest_music_file(since: float) -> str | None:
+def new_audio_files(since: float, music_dir: str) -> list[str]:
     """
-    Return the name of the newest audio file in MUSIC_DIR modified at or after
-    `since` (a time.time() timestamp), or None. Best-effort convenience only.
+    Basenames of audio files in `music_dir` modified at or after `since`.
+    Used when the downloader's stdout doesn't name the saved file.
     """
-    if not MUSIC_DIR:
-        return None
-    music_path = Path(MUSIC_DIR)
+    if not music_dir:
+        return []
+    music_path = Path(music_dir)
     if not music_path.is_dir():
-        return None
-    newest_name: str | None = None
-    newest_mtime = since - 1  # accept files touched during the run
+        return []
+    found: list[tuple[float, str]] = []
     for entry in music_path.iterdir():
-        if entry.suffix.lower() not in {".mp3", ".m4a", ".opus", ".flac", ".wav"}:
+        if entry.suffix.lower() not in _AUDIO_EXTS:
             continue
         try:
             mtime = entry.stat().st_mtime
         except OSError:
             continue
-        if mtime >= since and mtime > newest_mtime:
-            newest_mtime = mtime
-            newest_name = entry.name
-    return newest_name
+        if mtime >= since - 1:  # accept files touched during the run
+            found.append((mtime, entry.name))
+    found.sort()
+    return [name for _, name in found]
 
 
-async def _run_subprocess(argv: list[str], cwd: str) -> tuple[int, str, str]:
+def display_saved_path(music_dir: str, filename: str) -> str:
+    """Relative path from the DJ folder, e.g. Music/Artist - Title.mp3."""
+    folder = Path(music_dir).name if music_dir else "Music"
+    return f"{folder}/{os.path.basename(filename)}"
+
+
+def format_saved_reply(
+    music_dir: str,
+    filenames: list[str],
+    *,
+    via: str | None = None,
+) -> str:
+    paths = [display_saved_path(music_dir, n) for n in filenames]
+    if via == "spotify":
+        head = "✅ Done (via Spotify → YouTube)! Saved:"
+    else:
+        head = "✅ Done! Saved:"
+    if len(paths) == 1:
+        return f"{head}\n{paths[0]}"
+    listed = "\n".join(f"• {p}" for p in paths)
+    return f"{head} {len(paths)} tracks:\n{listed}"
+
+
+def log_job_output(tool: str, rc: int, stdout: str, stderr: str) -> None:
+    """Write the downloader's tail to the bot log so `tail -f` is useful."""
+    combined = _strip_ansi(f"{stdout}\n{stderr}").strip()
+    lines = combined.splitlines()
+    tail = "\n".join(lines[-50:]) if lines else "(no output)"
+    log.info("%s finished rc=%s\n%s", tool, rc, tail)
+
+
+def _merge_names(*groups: list[str]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for raw in group:
+            name = os.path.basename(raw.strip())
+            if name and name not in seen:
+                seen.add(name)
+                ordered.append(name)
+    return ordered
+
+
+async def _run_subprocess(
+    argv: list[str],
+    cwd: str,
+    extra_env: dict[str, str] | None = None,
+) -> tuple[int, str, str]:
     """
     Run a command (no shell) and capture output.
 
     Returns (return_code, stdout, stderr); return_code is -1 on timeout.
     Passing argv as a list means arguments with spaces/quotes are delivered
     verbatim — there is no shell-injection surface from message text.
+    extra_env overlays the current environment for this child only (so two
+    users can download into different folders at the same time).
     """
     log.info("Running: %s", " ".join(shlex.quote(a) for a in argv))
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
     proc = await asyncio.create_subprocess_exec(
         *argv,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
+        env=env,
     )
     try:
         stdout_b, stderr_b = await asyncio.wait_for(
@@ -246,25 +356,32 @@ async def _run_subprocess(argv: list[str], cwd: str) -> tuple[int, str, str]:
     return proc.returncode if proc.returncode is not None else -1, stdout, stderr
 
 
-async def run_music_dl(arg: str) -> tuple[int, str, str]:
+async def run_music_dl(arg: str, music_dir: str) -> tuple[int, str, str]:
     """
     Run `music-dl <arg>` in one-shot mode. `arg` is a direct URL (YouTube,
     SoundCloud, …) or a search string. music-dl runs from its own directory so
-    its relative ./Music and ./.download-archive.txt resolve as they do by hand.
+    its relative paths resolve as they do by hand; MUSIC_DIR / ARCHIVE are
+    passed in the child env so this user's library is used.
     """
+    extra_env = {
+        "MUSIC_DIR": music_dir,
+        "ARCHIVE": archive_for_music_dir(music_dir),
+    }
     return await _run_subprocess(
         [MUSIC_DL, arg],
         cwd=str(Path(MUSIC_DL).resolve().parent),
+        extra_env=extra_env,
     )
 
 
-async def run_spotdl(url: str) -> tuple[int, str, str]:
+async def run_spotdl(url: str, music_dir: str) -> tuple[int, str, str]:
     """
     Download a Spotify track/album/playlist via spotdl. spotdl reads the
     Spotify metadata and fetches the matching audio from YouTube, saving mp3s
-    into MUSIC_DIR (Spotify's own audio is DRM-protected and can't be pulled).
+    into this user's library (Spotify's own audio is DRM-protected and can't
+    be pulled).
     """
-    outdir = music_output_dir()
+    outdir = music_dir
     os.makedirs(outdir, exist_ok=True)
     # Force mp3 and a clean "Artist - Title.mp3" name, saved into the music dir.
     output_template = os.path.join(outdir, "{artists} - {title}.{output-ext}")
@@ -276,6 +393,10 @@ async def run_spotdl(url: str) -> tuple[int, str, str]:
         "mp3",
         "--output",
         output_template,
+        "--simple-tui",
+        "--print-errors",
+        "--log-level",
+        "INFO",
     ]
     return await _run_subprocess(argv, cwd=outdir)
 
@@ -289,8 +410,9 @@ _AUDIO_EXTS = {".mp3", ".m4a", ".opus", ".flac", ".wav", ".aac", ".ogg"}
 # over the raw [download] Destination (which is often the pre-transcode
 # container like .webm/.m4a). Group 1 is always the path/name.
 _FINAL_FILE_PATTERNS = [
-    # music-dl success line, e.g.:  ok "Artist - Title.mp3"
+    # music-dl success line, e.g.:  * Artist - Title.mp3  (or older: ok "…")
     re.compile(r'\bok\s+"([^"]+)"'),
+    re.compile(r'^\*\s+(.+\.(?:mp3|m4a|opus|flac|wav))\s*$', re.MULTILINE | re.IGNORECASE),
     # yt-dlp moving the finished file into place:
     #   [MoveFiles] Moving file "tmp.mp3" to "Artist - Title.mp3"
     re.compile(r'\[MoveFiles\][^\n]*?\bto\s+"([^"]+)"'),
@@ -365,73 +487,155 @@ def is_already_in_library(stdout: str, stderr: str) -> bool:
     return any(p.search(text) for p in _ALREADY_PATTERNS)
 
 
-def summarize_result(rc: int, stdout: str, stderr: str, newest: str | None) -> str:
+def _strip_ansi(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", text)
+
+
+def _error_lines(stdout: str, stderr: str) -> list[str]:
+    """
+    Pull yt-dlp / spotdl `ERROR:` lines out of combined output.
+
+    music-dl tees yt-dlp into stdout, then writes a generic `x failed: <query>`
+    to stderr. Preferring stderr alone hid the real reason in Telegram.
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+    for raw in (stdout + "\n" + stderr).splitlines():
+        line = _strip_ansi(raw).strip()
+        if not re.match(r"^ERROR:", line, re.IGNORECASE):
+            continue
+        line = re.sub(r"^ERROR:\s*", "", line, flags=re.IGNORECASE)
+        if line and line not in seen:
+            seen.add(line)
+            found.append(line)
+    return found
+
+
+def explain_download_failure(tool: str, rc: int, stdout: str, stderr: str) -> str:
+    """Turn a failed music-dl / spotdl run into a clear Telegram reply."""
+    errors = _error_lines(stdout, stderr)
+    blob = "\n".join(errors).lower() if errors else _strip_ansi(stdout + "\n" + stderr).lower()
+
+    if "http error 403" in blob or "403: forbidden" in blob:
+        return (
+            "❌ YouTube refused the download (HTTP 403).\n"
+            "This usually means yt-dlp is out of date.\n\n"
+            "On the Mac, run:\n"
+            "  brew upgrade yt-dlp\n"
+            "then send the song again."
+        )
+    if "sign in to confirm" in blob or "not a bot" in blob:
+        return (
+            "❌ YouTube asked for a sign-in (bot check).\n"
+            "Try again later, or paste a different link."
+        )
+    if "private video" in blob or "video unavailable" in blob:
+        extra = errors[-1] if errors else "Private, deleted, or region-blocked."
+        return f"❌ That video isn't available.\n{extra}"
+    if "unable to download webpage" in blob or "network is unreachable" in blob:
+        extra = errors[-1] if errors else "Check the Mac's internet and try again."
+        return f"❌ Network error talking to YouTube.\n{extra}"
+
+    if errors:
+        return f"❌ {tool} failed:\n" + "\n".join(errors[-3:])[:1500]
+
+    useful = []
+    for raw in (stdout + "\n" + stderr).splitlines():
+        line = _strip_ansi(raw).strip()
+        if not line or re.match(r"^x failed:", line):
+            continue
+        useful.append(line)
+    tail = "\n".join(useful[-6:])[:1500] if useful else "no output from the downloader"
+    return f"❌ {tool} failed (exit {rc}):\n{tail}"
+
+
+def summarize_result(
+    rc: int,
+    stdout: str,
+    stderr: str,
+    found: list[str],
+    music_dir: str,
+) -> str:
     """Turn music-dl's output into a short, friendly reply for the user."""
     if rc == -1:
         return "⏱️ Timed out. The download took too long and was stopped."
 
     if rc == 0:
-        filenames = extract_downloaded_filenames(stdout, stderr)
+        filenames = _merge_names(extract_downloaded_filenames(stdout, stderr), found)
 
         if filenames:
-            # We know exactly what was saved — name each file.
-            if len(filenames) == 1:
-                return f"✅ Done! Saved:\n{filenames[0]}"
-            listed = "\n".join(f"• {n}" for n in filenames)
-            return f"✅ Done! Saved {len(filenames)} tracks:\n{listed}"
+            return format_saved_reply(music_dir, filenames)
 
         # No filename in the output. If it was an archive skip, say so.
         if is_already_in_library(stdout, stderr):
-            return "✅ Already in your library — skipped (no re-download)."
+            folder = Path(music_dir).name if music_dir else "Music"
+            return f"✅ Already in your library — skipped (no re-download).\nLooked in: {folder}/"
 
-        # Last resort: the newest file that appeared in MUSIC_DIR during the run.
-        if newest:
-            return f"✅ Done! Saved:\n{newest}"
+        folder = Path(music_dir).name if music_dir else "Music"
+        tail = "\n".join(_strip_ansi(stdout + "\n" + stderr).splitlines()[-8:])[:800]
+        return (
+            f"❌ music-dl finished, but no new file appeared in {folder}/.\n"
+            f"{tail or 'no output'}"
+        )
 
-        return "✅ Done! Download finished."
-
-    # Non-zero exit: surface the tail of stderr/stdout so the user has a clue.
-    detail = (stderr.strip() or stdout.strip() or "no output").splitlines()
-    tail = "\n".join(detail[-8:])[:1500]
-    return f"❌ music-dl failed (exit {rc}):\n{tail}"
+    log.warning(
+        "music-dl failed rc=%s: %s",
+        rc,
+        "; ".join(_error_lines(stdout, stderr)) or "no ERROR line",
+    )
+    return explain_download_failure("music-dl", rc, stdout, stderr)
 
 
 # --------------------------------------------------------------------------- #
 # Spotify (spotdl) output parsing
 # --------------------------------------------------------------------------- #
 
-# spotdl prints one line per track, e.g.:  Downloaded "Artist - Title"
+# spotdl prints one line per track, e.g.:  Downloaded "Artist - Title": <url>
 _SPOTDL_DOWNLOADED = re.compile(r'Downloaded\s+"([^"]+)"')
 # and for files it skips:  Skipping Artist - Title (file already exists)
 _SPOTDL_SKIPPED = re.compile(r'Skipping\s+(.+?)\s+\(file already exists', re.IGNORECASE)
 
 
-def summarize_spotdl(rc: int, stdout: str, stderr: str) -> str:
+def summarize_spotdl(
+    rc: int,
+    stdout: str,
+    stderr: str,
+    found: list[str],
+    music_dir: str,
+) -> str:
     """Turn spotdl's output into a friendly reply, naming each saved track."""
     if rc == -1:
         return "⏱️ Timed out. The Spotify download took too long and was stopped."
 
-    text = stdout + "\n" + stderr
+    text = _strip_ansi(stdout + "\n" + stderr)
     downloaded = [m.group(1) for m in _SPOTDL_DOWNLOADED.finditer(text)]
     skipped = [m.group(1) for m in _SPOTDL_SKIPPED.finditer(text)]
 
     # spotdl's "Downloaded" names have no extension; we save as .mp3.
     names = [n if n.lower().endswith(".mp3") else f"{n}.mp3" for n in downloaded]
+    names = _merge_names(names, found)
 
     if rc == 0:
         if names:
-            if len(names) == 1:
-                return f"✅ Done (via Spotify → YouTube)! Saved:\n{names[0]}"
-            listed = "\n".join(f"• {n}" for n in names)
-            return f"✅ Done (via Spotify → YouTube)! Saved {len(names)} tracks:\n{listed}"
+            return format_saved_reply(music_dir, names, via="spotify")
         if skipped:
-            return "✅ Already in your library — skipped (no re-download)."
-        return "✅ Done! Spotify download finished."
+            skip_names = [n if n.lower().endswith(".mp3") else f"{n}.mp3" for n in skipped]
+            folder = Path(music_dir).name if music_dir else "Music"
+            listed = "\n".join(f"• {folder}/{os.path.basename(n)}" for n in skip_names)
+            return f"✅ Already in your library — skipped.\n{listed}"
+        folder = Path(music_dir).name if music_dir else "Music"
+        tail = "\n".join(text.splitlines()[-8:])[:800]
+        return (
+            f"❌ Spotify download finished, but no new file appeared in {folder}/.\n"
+            f"{tail or 'no output'}"
+        )
 
-    # Failure: surface the tail so the user has a clue.
-    detail = (stderr.strip() or stdout.strip() or "no output").splitlines()
-    tail = "\n".join(detail[-8:])[:1500]
-    return f"❌ spotdl failed (exit {rc}):\n{tail}"
+    log.warning(
+        "spotdl failed rc=%s: %s",
+        rc,
+        "; ".join(_error_lines(stdout, stderr)) or "no ERROR line",
+    )
+    return explain_download_failure("spotdl", rc, stdout, stderr)
 
 
 # --------------------------------------------------------------------------- #
@@ -562,6 +766,157 @@ def classify(token: str) -> tuple[str, str]:
 
 
 # --------------------------------------------------------------------------- #
+# Once-a-day dependency updates (yt-dlp / spotdl)
+# --------------------------------------------------------------------------- #
+
+# Written after today's check so later downloads skip brew/pip. Gitignored.
+DEPS_STAMP = Path(__file__).resolve().parent / ".deps-checked"
+DEPS_UPDATE_TIMEOUT = int(os.environ.get("DEPS_UPDATE_TIMEOUT", "300"))
+_deps_lock: asyncio.Lock | None = None
+
+
+def _deps_checked_today() -> bool:
+    try:
+        return DEPS_STAMP.read_text(encoding="utf-8").strip() == date.today().isoformat()
+    except OSError:
+        return False
+
+
+def _mark_deps_checked() -> None:
+    try:
+        DEPS_STAMP.write_text(date.today().isoformat() + "\n", encoding="utf-8")
+    except OSError as exc:
+        log.warning("Could not write %s: %s", DEPS_STAMP, exc)
+
+
+def _run_cmd(
+    argv: list[str],
+    timeout: int,
+    extra_env: dict[str, str] | None = None,
+) -> tuple[int, str]:
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+    except FileNotFoundError:
+        return -1, f"not found: {argv[0]}"
+    except subprocess.TimeoutExpired:
+        return -1, f"timed out after {timeout}s"
+    text = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+    return proc.returncode if proc.returncode is not None else -1, text
+
+
+def _cmd_version(argv: list[str]) -> str:
+    rc, out = _run_cmd(argv, timeout=30)
+    if rc != 0:
+        return ""
+    for line in out.splitlines():
+        line = line.strip()
+        if line:
+            return line.split()[0]
+    return ""
+
+
+def _brew_bin() -> str:
+    for candidate in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew"):
+        if os.path.isfile(candidate):
+            return candidate
+    return "brew"
+
+
+def _homebrew_ytdlp() -> str:
+    brew = _brew_bin()
+    prefix = str(Path(brew).parent)
+    for candidate in (f"{prefix}/yt-dlp", "/opt/homebrew/bin/yt-dlp", "/usr/local/bin/yt-dlp"):
+        if os.path.isfile(candidate):
+            return candidate
+    return "yt-dlp"
+
+
+def _upgrade_download_deps() -> str:
+    """
+    Upgrade Homebrew yt-dlp plus the venv's yt-dlp and spotdl.
+    Returns a short Telegram-ready summary. Always stamps today's date so we
+    only do this once per day even if a command fails.
+    """
+    notes: list[str] = []
+    brew = _brew_bin()
+    brew_ytdlp = _homebrew_ytdlp()
+    before_brew = _cmd_version([brew_ytdlp, "--version"])
+    rc, out = _run_cmd(
+        [brew, "upgrade", "yt-dlp"],
+        timeout=DEPS_UPDATE_TIMEOUT,
+        extra_env={"HOMEBREW_NO_ENV_HINTS": "1"},
+    )
+    after_brew = _cmd_version([brew_ytdlp, "--version"]) or before_brew
+    if rc != 0:
+        tail = out.splitlines()[-1] if out else "unknown error"
+        notes.append(f"Homebrew yt-dlp update failed ({tail})")
+        log.warning("brew upgrade yt-dlp failed rc=%s\n%s", rc, out[-1500:])
+    elif before_brew and after_brew and before_brew != after_brew:
+        notes.append(f"Homebrew yt-dlp {before_brew} → {after_brew}")
+        log.info("Upgraded Homebrew yt-dlp %s -> %s", before_brew, after_brew)
+    else:
+        notes.append(f"Homebrew yt-dlp {after_brew or '?'} (current)")
+
+    before_venv = _cmd_version(
+        [sys.executable, "-c", "import yt_dlp; print(yt_dlp.version.__version__)"]
+    )
+    rc, out = _run_cmd(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "-U",
+            "--disable-pip-version-check",
+            "--index-url",
+            "https://pypi.org/simple",
+            "yt-dlp",
+            "spotdl",
+        ],
+        timeout=DEPS_UPDATE_TIMEOUT,
+    )
+    after_venv = _cmd_version(
+        [sys.executable, "-c", "import yt_dlp; print(yt_dlp.version.__version__)"]
+    ) or before_venv
+    if rc != 0:
+        tail = out.splitlines()[-1] if out else "unknown error"
+        notes.append(f"venv yt-dlp/spotdl update failed ({tail})")
+        log.warning("pip install -U yt-dlp spotdl failed rc=%s\n%s", rc, out[-1500:])
+    elif before_venv and after_venv and before_venv != after_venv:
+        notes.append(f"venv yt-dlp {before_venv} → {after_venv}")
+        log.info("Upgraded venv yt-dlp %s -> %s", before_venv, after_venv)
+    else:
+        notes.append(f"venv yt-dlp {after_venv or '?'} (current)")
+
+    _mark_deps_checked()
+    return "🔧 Daily tool check:\n" + "\n".join(notes)
+
+
+async def maybe_refresh_deps() -> str | None:
+    """
+    On the first download of the day, upgrade yt-dlp / spotdl.
+    Returns a status line to send in Telegram, or None if already checked today.
+    """
+    global _deps_lock
+    if _deps_lock is None:
+        _deps_lock = asyncio.Lock()
+    async with _deps_lock:
+        if _deps_checked_today():
+            return None
+        log.info("Daily dependency check starting")
+        return await asyncio.to_thread(_upgrade_download_deps)
+
+
+# --------------------------------------------------------------------------- #
 # Handlers
 # --------------------------------------------------------------------------- #
 
@@ -603,19 +958,22 @@ async def cmd_id(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def process_job(kind: str, value: str) -> str:
+async def process_job(kind: str, value: str, music_dir: str) -> str:
     """Run one download job and return the reply text. Never raises."""
     try:
         if kind == "spotify":
             try:
-                rc, out, err = await run_spotdl(value)
+                started = time.time()
+                rc, out, err = await run_spotdl(value, music_dir)
             except FileNotFoundError:
                 return (
                     "❌ Spotify links need spotdl, which isn't installed.\n"
                     "Install it in the bot's venv:\n"
                     "  <venv>/bin/python3 -m pip install spotdl"
                 )
-            return summarize_spotdl(rc, out, err)
+            log_job_output("spotdl", rc, out, err)
+            found = new_audio_files(started, music_dir)
+            return summarize_spotdl(rc, out, err, found, music_dir)
 
         if kind == "shazam":
             query = await asyncio.to_thread(resolve_shazam, value)
@@ -625,21 +983,25 @@ async def process_job(kind: str, value: str) -> str:
                     "sending me the song name instead."
                 )
             started = time.time()
-            rc, out, err = await run_music_dl(query)
-            base = summarize_result(rc, out, err, _newest_music_file(started))
+            rc, out, err = await run_music_dl(query, music_dir)
+            log_job_output("music-dl", rc, out, err)
+            found = new_audio_files(started, music_dir)
+            base = summarize_result(rc, out, err, found, music_dir)
             return f"🎧 Shazam → {query}\n{base}"
 
         # "direct" (YouTube/SoundCloud/etc.) or "search" — both go to music-dl.
         try:
             started = time.time()
-            rc, out, err = await run_music_dl(value)
+            rc, out, err = await run_music_dl(value, music_dir)
         except FileNotFoundError:
             return (
                 "❌ Could not run music-dl.\n"
                 f"MUSIC_DL is set to: {MUSIC_DL or '(unset)'}\n"
                 "Check that the path is correct and the file is executable."
             )
-        return summarize_result(rc, out, err, _newest_music_file(started))
+        log_job_output("music-dl", rc, out, err)
+        found = new_audio_files(started, music_dir)
+        return summarize_result(rc, out, err, found, music_dir)
 
     except Exception as exc:  # defensive: never let a job crash the handler
         log.exception("Unexpected error in job %s(%r)", kind, value)
@@ -664,6 +1026,19 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     links = [t for t in tokens if is_url(t)]
     jobs = [classify(t) for t in links] if links else [classify(text)]
 
+    user_id = update.effective_user.id if update.effective_user else None
+    music_dir = music_dir_for_user(user_id)
+    log.info("Download for user id=%s -> %s", user_id, music_dir)
+
+    # First download of the calendar day: upgrade yt-dlp (Homebrew + venv) and
+    # spotdl so YouTube extractor breakage does not sit stale for weeks.
+    if not _deps_checked_today():
+        await message.reply_text("🔧 Checking yt-dlp / spotdl for updates (once a day)…")
+        await ctx.bot.send_chat_action(message.chat_id, ChatAction.TYPING)
+        deps_note = await maybe_refresh_deps()
+        if deps_note:
+            await message.reply_text(deps_note[:MAX_TG_MESSAGE])
+
     # Immediate acknowledgment so the user knows we're on it.
     ack = "⬇️ Downloading…" if len(jobs) == 1 else f"⬇️ Downloading {len(jobs)} items…"
     await message.reply_text(ack)
@@ -671,7 +1046,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
     for i, (kind, value) in enumerate(jobs, start=1):
         prefix = f"[{i}/{len(jobs)}] " if len(jobs) > 1 else ""
-        reply = await process_job(kind, value)
+        reply = await process_job(kind, value, music_dir)
         await message.reply_text((prefix + reply)[:MAX_TG_MESSAGE])
 
 
@@ -696,6 +1071,16 @@ def _validate_config() -> None:
             "ALLOWED_USER_IDS is empty: no one can download yet. "
             "Send /id to the bot to find your ID, then set it in the plist."
         )
+    if DALIZAS_USER_ID is not None and not DALIZAS_MUSIC_DIR:
+        log.warning(
+            "DALIZAS_USER_ID is set but DALIZAS_MUSIC_DIR is empty; "
+            "that user will download into MUSIC_DIR."
+        )
+    if CLAIRE_USER_ID is not None and not CLAIRE_MUSIC_DIR:
+        log.warning(
+            "CLAIRE_USER_ID is set but CLAIRE_MUSIC_DIR is empty; "
+            "that user will download into MUSIC_DIR."
+        )
     if problems:
         for p in problems:
             log.error("CONFIG ERROR: %s", p)
@@ -706,7 +1091,20 @@ def main() -> None:
     _validate_config()
 
     log.info("Starting music bot. Authorized user IDs: %s", sorted(ALLOWED_USER_IDS))
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    log.info("Default library (MUSIC_DIR): %s", music_output_dir())
+    if DALIZAS_USER_ID is not None and DALIZAS_MUSIC_DIR:
+        log.info(
+            "User %s library (DALIZAS_MUSIC_DIR): %s",
+            DALIZAS_USER_ID,
+            DALIZAS_MUSIC_DIR,
+        )
+    if CLAIRE_USER_ID is not None and CLAIRE_MUSIC_DIR:
+        log.info(
+            "User %s library (CLAIRE_MUSIC_DIR): %s",
+            CLAIRE_USER_ID,
+            CLAIRE_MUSIC_DIR,
+        )
+    app =Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
     app.add_handler(CommandHandler("id", cmd_id))

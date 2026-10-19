@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# music-dl - download YouTube (and most other sites) audio as MP3 into ./Music
+# music-dl - download YouTube (and most other sites) audio as MP3 into ./Music/All Songs
 #
 #   ./music-dl                     interactive: paste a URL, hit enter, repeat
 #   ./music-dl <url> [url ...]     one-shot
@@ -14,12 +14,14 @@
 #   -h, --help     show this
 #
 # Env overrides:
-#   MUSIC_DIR=/some/path ./music-dl ...     write somewhere other than ./Music
+#   MUSIC_DIR=/some/path ./music-dl ...     write somewhere other than ./Music/All Songs
 #
 set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MUSIC_DIR="${MUSIC_DIR:-$SCRIPT_DIR/Music}"
+# Downloads land in All Songs/; categorize-library (or the bot) files them
+# into "<Genre> <Decade>/" folders.
+MUSIC_DIR="${MUSIC_DIR:-$SCRIPT_DIR/Music/All Songs}"
 ARCHIVE="${ARCHIVE:-$SCRIPT_DIR/.download-archive.txt}"
 
 CLEAN=1

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# refresh-library - give every MP3 in Music/ embedded cover art, real ID3 tags,
+# refresh-library - give every MP3 in Music/All Songs/ embedded cover art, real ID3 tags,
 # and better audio where a genuine match exists.
 #
 # Your originals are NEVER modified. Results go to Music-refreshed/.
@@ -22,7 +22,10 @@
 set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC="$SCRIPT_DIR/Music"
+# The real files live in All Songs/ (genre folders are hard links into it);
+# before categorize-library --apply, the library is still flat.
+SRC="$SCRIPT_DIR/Music/All Songs"
+[ -d "$SRC" ] || SRC="$SCRIPT_DIR/Music"
 DEST="$SCRIPT_DIR/Music-refreshed"
 WORK="$DEST/.work"
 ARCHIVE="$DEST/.archive.txt"

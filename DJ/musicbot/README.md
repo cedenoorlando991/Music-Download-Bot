@@ -18,11 +18,13 @@ at `/Users/orlandocedeno/Music-Download-Bot`.
 Music-Download-Bot/
 └── DJ/
     ├── music-dl               # the yt-dlp/ffmpeg download script
-    ├── Music/                 # downloaded MP3s land here (gitignored)
+    ├── Music/                 # library: All Songs/ + "<Genre> <Decade>/" folders (gitignored)
     └── musicbot/
         ├── music_bot.py       # the bot
+        ├── library.py         # genre + decade categorization, genre folders
+        ├── categorize_library.py  # bulk sorter (run via DJ/categorize-library)
         ├── com.user.musicbot.plist
-        ├── requirements.txt   # python-telegram-bot + spotdl
+        ├── requirements.txt   # python-telegram-bot + spotdl + mutagen
         ├── .env               # YOUR secrets/config (gitignored — never commit)
         ├── .env.example       # template
         └── venv/              # python virtualenv (gitignored)
@@ -128,8 +130,10 @@ From Telegram, send the bot any of:
 - a **Spotify** link (track, album, or playlist) → track info read, matching
   audio pulled from YouTube via spotdl (Spotify's own audio is DRM-protected;
   playlists/albums expand and download track by track)
-- a **Shazam** link (shazam.com or shz.am share links) → resolved to a song
-  name, then found on YouTube
+- a **Shazam** link (shazam.com `/track/` or `/song/` share links) → resolved
+  to artist + title through Shazam's track API (the website itself blocks
+  scrapers), then found on YouTube. Shazam's genre + release year feed the
+  genre folder.
 - a link from **any other yt-dlp-supported site** (Bandcamp, Vimeo, Mixcloud,
   and hundreds more) → passed straight to music-dl; works if yt-dlp can extract
   audio from it
@@ -138,10 +142,30 @@ From Telegram, send the bot any of:
 - several links at once (one per line) → all downloaded, each reported
   separately
 
-Every download lands as an MP3 in `DJ/Music/`, and a download archive prevents
-re-downloading anything already in your library.
+Every download lands as an MP3 in `<library>/All Songs/`, and a download
+archive prevents re-downloading anything already in your library.
 
-Commands: `/start`, `/help`, `/id` (shows your Telegram user ID for the allowlist).
+### Genre folders
+
+Each song is also hard-linked into a `<Genre> <Decade>/` folder next to
+`All Songs/` (e.g. `Dembow 2020s/`, `R&B 2000s/`) — same file, no extra disk
+space. The reply shows the genre (`🏷 Dembow · 2020s`) with a **✏️ Change genre**
+button: pick a genre, then a decade, and the song moves. Songs nobody could
+identify go to `Unknown/` and the reply opens straight onto the genre picker.
+
+Genres: Dembow, Reggaeton, Bachata & Tropical, Dancehall, Bouyon, Afrobeats &
+Amapiano, Rap & Hip Hop, R&B, Jersey Club & Bounce, Funk (Brazilian), Pop,
+Japanese Pop, Rock. Edit `GENRES` in `library.py` to change them.
+
+How the guess is made (first hit wins): your own earlier choice → a filename
+keyword (`dembow`, `bouyon`, `jersey`, `bounce`, …) → the source's genre
+(Shazam, or spotdl's ID3 tag) → iTunes search → Deezer search. Lookups only
+count when artist *and* title match. Choices are stored per library in
+`.genres.json` and win over any later guess.
+
+Commands: `/start`, `/help`, `/unknown` (walk through every Unknown song with
+genre buttons, one at a time), `/id` (shows your Telegram user ID for the
+allowlist).
 
 Keep the Mac awake so downloads don't stall: run `caffeinate -i` in a Terminal
 window, or set "prevent sleep" in System Settings.

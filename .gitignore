@@ -19,10 +19,14 @@ __pycache__/
 DJ/musicbot/.deps-checked
 
 # --- Downloaded music & personal library data ---
-/DJ/Music
+# Each library (All Songs/, genre folders, .genres.json, its archive) is personal.
+/DJ/Music/
+/DJ/Dalizas Music/
+/DJ/claire!/
+/DJ/Music-refreshed/
 DJ/.download-archive.txt
+DJ/categorize-report.tsv
+DJ/categorize-report.tmp
 
 # --- Feature staging files (consumed by the commit script) ---
 *.new
-/DJ/claire\!
-/DJ

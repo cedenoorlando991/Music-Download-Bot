@@ -14,6 +14,10 @@ python-telegram-bot==21.6
 # Loosely pinned so pip can pick a build compatible with your Python version.
 spotdl>=4.5,<5
 
+# Genre folders: reads/writes the ID3 genre tag. (spotdl already pulls it in;
+# listed so the bot works without spotdl too.)
+mutagen>=1.47
+
 # NOTE: SoundCloud and Shazam need NO extra packages — SoundCloud is handled by
-# the yt-dlp inside your music-dl script, and Shazam links are resolved with the
-# Python standard library (urllib).
+# the yt-dlp inside your music-dl script, and Shazam links (plus the iTunes /
+# Deezer / MusicBrainz genre lookups) use the Python standard library (urllib).

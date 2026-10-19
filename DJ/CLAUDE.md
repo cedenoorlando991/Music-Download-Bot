@@ -1,6 +1,7 @@
 # DJ — YouTube to MP3 library
 
-Personal DJ music library plus the tool that fills it. Not a git repo.
+Personal DJ music library plus the tools that fill and sort it. Lives inside the
+`Music-Download-Bot` git repo (the libraries themselves are gitignored).
 
 ## Layout
 
@@ -8,7 +9,14 @@ Personal DJ music library plus the tool that fills it. Not a git repo.
 DJ/
 ├── music-dl                 # the main tool: one bash script, no deps of its own
 ├── refresh-library          # one-off bulk backfill of art/tags onto existing files
-├── Music/                   # the library — every MP3 lands here (note: capital M)
+├── categorize-library       # sorts libraries into genre+decade folders (wraps musicbot/categorize_library.py)
+├── Music/                   # owner library (note: capital M)
+│   ├── All Songs/           #   every real audio file — downloads land here
+│   ├── <Genre> <Decade>/    #   hard links into All Songs/, e.g. "Dembow 2020s"
+│   ├── Unknown/             #   no confident genre yet; the bot asks the user
+│   └── .genres.json         #   per-file genre/decade/source; source "user" is sticky
+├── Dalizas Music/, claire!/ # same layout, one library per Telegram user
+├── musicbot/                # Telegram bot (music_bot.py) + library.py (genre logic)
 ├── Music-refreshed/         # output of refresh-library; NOT the live library
 ├── .download-archive.txt    # yt-dlp archive of downloaded video IDs, for dedup
 ├── refresh-report.tsv       # last refresh-library run, one row per file
@@ -20,7 +28,7 @@ DJ/
 
 Wraps `yt-dlp` + `ffmpeg`. Takes a YouTube URL (or a search phrase), extracts
 bestaudio, transcodes to 320 kbps MP3, embeds the thumbnail as cover art, writes
-ID3 artist/title/date tags, and moves the result into `Music/`.
+ID3 artist/title/date tags, and moves the result into `Music/All Songs/`.
 
 Two modes, both in the same script:
 
@@ -58,7 +66,9 @@ for them on startup and prints an install hint if either is missing.
 - **`--ignore-config` is deliberate.** Keeps a stray `~/.config/yt-dlp/config`
   from silently changing output paths or formats.
 - Everything writes through `--paths` / `--paths temp:`, so partial downloads land
-  in `Music/.tmp/` and never leave junk in the library on failure.
+  in `Music/All Songs/.tmp/` and never leave junk in the library on failure.
+- The bot runs one download at a time per library: music-dl's exit trap
+  deletes the shared `.tmp/`, which would kill a concurrent run's partial file.
 
 ## How the naming/tagging pipeline works
 
@@ -174,6 +184,51 @@ metadata-only check cannot see.
 
 The general lesson: the per-file `OLD`/`NEW` duration columns in the report are
 what surfaced both bugs. Keep logging real measured values, not intended ones.
+
+## Genre folders (`musicbot/library.py`)
+
+Invariants — all load-bearing:
+
+- **`All Songs/` holds the only real copy.** Genre folders are hard links
+  (`os.link`), never copies or symlinks — DJ software must see real files, and
+  re-filing a song is just unlink + link. `place()` only unlinks a file in a
+  genre folder when `os.path.samefile` says it *is* the All Songs file, so
+  anything the user dropped in by hand is never deleted.
+- **Tag writes must stay in place.** mutagen rewrites the same inode, which keeps
+  the hard links linked. Anything that writes a temp file and renames over the
+  original (e.g. `ffmpeg -c copy` + `mv`) silently breaks the link.
+- **A user's Telegram choice (`source: "user"`) is never overwritten** by any
+  later guess — `resolve()`, `categorize-library`, and re-downloads all check it.
+- A guess missing either genre or decade goes to `Unknown/` so the user is asked;
+  only a user choice with "Not sure" decade gets a decade-less `<Genre>/` folder.
+
+Guess order: filename keyword → source hint (Shazam genre, spotdl's ID3 genre)
+→ iTunes search → Deezer search (+ MusicBrainz first-release year, because
+Deezer album dates are reissues — 2Pac 1997 came back 2011). A lookup hit
+counts only if artist **and** title match: the top iTunes result is frequently
+a different song by the same artist. Apple calls dembow and reggaeton both
+"Urbano latino"; `DEMBOW_ARTISTS` tips Dominican artists to Dembow, and
+`BACHATA_ARTISTS` pulls bachata acts out of "Pop Latino" (Aventura). Both only
+override a broad genre (Unknown/Pop/Reggaeton), never e.g. a Rap hit. A
+YouTube download's ID3 genre is just the video category ("Music") and maps to
+Unknown — don't treat it as a real hint.
+
+Filenames are messy: `parse_name` splits on the first separator (` - `, `—`,
+`–`, `Jackson- X`, `Combo -X`, `｜`, `·`; never a bare hyphen like `Jay-Z`), and
+`categorize` retries the lookup with artist/title swapped because many files
+are `Title - Artist`. Keyword-genre edits with no lookup hit take their decade
+from the ID3 date music-dl wrote (the YouTube upload year).
+
+iTunes allows ~20 requests/minute; `_itunes_get` paces at 3.1s. A full
+`categorize-library` dry run over ~420 songs takes ~50 minutes. It saves
+`categorize-report.tsv` after every song and skips songs already in it, so a
+stopped run resumes; pass `--fresh` after changing the guessing logic.
+
+**Shazam:** shazam.com returns HTTP 405 to any non-browser request, so page
+scraping is dead. `/track/<key>` links go through
+`cdn.shazam.com/discovery/v5/en-US/US/web/-/track/<key>` (JSON with title,
+subtitle=artist, genres.primary, Released year); `/song/<id>` links carry an
+Apple Music id → `itunes.apple.com/lookup?id=`.
 
 ## Known rough edges
 

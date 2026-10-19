@@ -1,7 +1,8 @@
 # music-dl
 
 Grab audio from a YouTube link (lyric videos, official videos, whatever) and drop
-a tagged 320 kbps MP3 into [`Music/`](Music).
+a tagged 320 kbps MP3 into `Music/All Songs/`, then (via the bot or
+`categorize-library`) into a genre + decade folder like `Music/Dembow 2020s/`.
 
 ## Everyday use
 
@@ -15,7 +16,7 @@ You get a prompt. Paste a YouTube URL, press enter, wait a few seconds. Repeat a
 many times as you want. Type `q` when you're done.
 
 ```
-music-dl - YouTube to MP3, saved in /Users/orlandocedeno/DJ/Music
+music-dl - YouTube to MP3, saved in /Users/orlandocedeno/DJ/Music/All Songs
 Paste a URL and press enter. Or type a song name to search for it.
 Commands: q = quit, ls = recent downloads, open = open the folder
 
@@ -34,8 +35,8 @@ At the `url>` prompt you can also type:
 | a YouTube URL | downloads exactly that video |
 | several URLs on one line, space separated | downloads all of them |
 | a song name, e.g. `sza snooze` | finds the **lyric video** and downloads that |
-| `ls` | shows the 10 most recent files in `Music/` |
-| `open` | opens `Music/` in Finder |
+| `ls` | shows the 10 most recent files in `Music/All Songs/` |
+| `open` | opens `Music/All Songs/` in Finder |
 | `q` | quit (Ctrl-D works too) |
 
 ## Lyric videos
@@ -86,7 +87,7 @@ Several at once:
 
 ## What you get
 
-- **320 kbps MP3** in `Music/`
+- **320 kbps MP3** in `Music/All Songs/`
 - **Cover art** embedded from the video thumbnail
 - **Real ID3 tags** — artist, title, year — so DJ software (rekordbox, Serato,
   Traktor) sorts it properly instead of showing one giant blob of a filename
@@ -178,10 +179,36 @@ audio it already had and gains an image.
 Once you've listened and you're happy:
 
 ```bash
-mv Music Music-old && mv Music-refreshed Music
+cp -R Music Music-old
+cp Music-refreshed/*.mp3 "Music/All Songs/"
+./categorize-library --apply Music
 ```
 
-Keep `Music-old` around until you're sure.
+Copying over an existing file rewrites it in place, so its genre-folder hard
+links keep pointing at the refreshed audio. Don't `mv` the folders — that would
+drop `All Songs/`, the genre folders and `.genres.json`. Keep `Music-old` around
+until you're sure.
+
+## Genre folders: `categorize-library`
+
+Every library (`Music/`, `Dalizas Music/`, `claire!/`) is laid out as:
+
+```
+All Songs/          every MP3 (the real files)
+Dembow 2020s/       hard links into All Songs/ — same file, no extra space
+R&B 2000s/
+Unknown/            couldn't tell; the Telegram bot's /unknown asks you
+```
+
+```bash
+./categorize-library                # dry run: writes categorize-report.tsv, moves nothing
+./categorize-library --apply        # move loose files into All Songs/ + link into genre folders
+./categorize-library --dry-run "claire!"   # one library
+```
+
+The dry run looks each song up (iTunes, then Deezer) and takes about 7 seconds
+a song. Fix any genre/decade in the report (set `source` to `user` so it
+sticks), then `--apply` uses the report instead of looking everything up again.
 
 ## Files
 
@@ -189,7 +216,9 @@ Keep `Music-old` around until you're sure.
 |---|---|
 | [`music-dl`](music-dl) | the main downloader |
 | [`refresh-library`](refresh-library) | bulk art/tag backfill for files you already had |
-| [`Music/`](Music) | your library, where every MP3 lands |
+| [`Music/`](Music) | your library: `All Songs/` holds every MP3, `<Genre> <Decade>/` folders hard-link into it |
+| [`categorize-library`](categorize-library) | sorts a library into genre + decade folders (dry run by default) |
+| `categorize-report.tsv` | the last dry run — edit its genre/decade columns, then `--apply` |
 | `Music-refreshed/` | output of `refresh-library` — review, then swap in |
 | `.download-archive.txt` | list of already-downloaded video IDs (delete to reset dedup) |
 | `refresh-report.tsv` | per-file record of the last refresh run |

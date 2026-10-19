@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+#
+# categorize-library - sort the libraries into All Songs/ + "<Genre> <Decade>/" folders
+#
+#   ./categorize-library                      dry run: writes categorize-report.tsv, moves nothing
+#   ./categorize-library --apply              move files + hard-link into genre folders
+#   ./categorize-library --dry-run "claire!"  one library only
+#
+# Runs musicbot/categorize_library.py with the bot's venv (it needs mutagen).
+#
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$SCRIPT_DIR/musicbot/venv/bin/python3" "$SCRIPT_DIR/musicbot/categorize_library.py" "$@"

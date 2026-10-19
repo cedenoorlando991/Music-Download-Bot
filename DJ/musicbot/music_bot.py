@@ -42,8 +42,15 @@ Any link (or bare song name) you send is routed automatically:
   * Spotify links -> spotdl reads the track metadata and downloads the matching
     audio from YouTube (Spotify audio itself is DRM-protected and cannot be
     downloaded). spotdl must be installed in the venv (pip install spotdl).
-  * Shazam links -> we resolve the link to "artist - title" and then run a
-    YouTube search through music-dl.
+  * Shazam links -> we resolve the link to "artist - title" (plus Apple's
+    genre and release year) via Shazam's track API, then run a YouTube search
+    through music-dl.
+
+Genre folders
+-------------
+Downloads land in <library>/All Songs/ and are hard-linked into a
+"<Genre> <Decade>/" folder (see library.py). Each reply shows the genre with a
+button to correct it; /unknown walks through songs nobody could identify.
 
 On the first download of each calendar day the bot upgrades Homebrew yt-dlp
 and the venv's yt-dlp + spotdl (YouTube breaks old extractors often). Later
@@ -59,20 +66,25 @@ import re
 import shlex
 import subprocess
 import sys
-import time
+import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
 )
+
+import library
 
 # --------------------------------------------------------------------------- #
 # Configuration (read once at startup from the environment)
@@ -172,6 +184,11 @@ def music_dir_for_user(user_id: int | None) -> str:
     return music_output_dir()
 
 
+def songs_dir(music_dir: str) -> str:
+    """Where downloads land inside a library: <library>/All Songs."""
+    return str(Path(music_dir) / library.ALL_SONGS)
+
+
 def archive_for_music_dir(music_dir: str) -> str:
     """
     Per-library yt-dlp archive so two users downloading the same video don't
@@ -246,34 +263,27 @@ async def deny(update: Update) -> None:
 # music-dl invocation
 # --------------------------------------------------------------------------- #
 
-def new_audio_files(since: float, music_dir: str) -> list[str]:
+def audio_names(music_dir: str) -> set[str]:
+    """Basenames of the audio files currently in `music_dir`."""
+    try:
+        return {e.name for e in Path(music_dir).iterdir() if e.suffix.lower() in _AUDIO_EXTS}
+    except OSError:
+        return set()
+
+
+def new_audio_files(before: set[str], music_dir: str) -> list[str]:
     """
-    Basenames of audio files in `music_dir` modified at or after `since`.
-    Used when the downloader's stdout doesn't name the saved file.
+    Audio files in `music_dir` that weren't there in the `before` snapshot.
+    Used when the downloader's stdout doesn't name the saved file. (Not an
+    mtime check: writing a genre tag touches the previous song's mtime, so a
+    multi-link message would re-report — and re-file — it.)
     """
-    if not music_dir:
-        return []
-    music_path = Path(music_dir)
-    if not music_path.is_dir():
-        return []
-    found: list[tuple[float, str]] = []
-    for entry in music_path.iterdir():
-        if entry.suffix.lower() not in _AUDIO_EXTS:
-            continue
-        try:
-            mtime = entry.stat().st_mtime
-        except OSError:
-            continue
-        if mtime >= since - 1:  # accept files touched during the run
-            found.append((mtime, entry.name))
-    found.sort()
-    return [name for _, name in found]
+    return sorted(audio_names(music_dir) - before)
 
 
 def display_saved_path(music_dir: str, filename: str) -> str:
-    """Relative path from the DJ folder, e.g. Music/Artist - Title.mp3."""
-    folder = Path(music_dir).name if music_dir else "Music"
-    return f"{folder}/{os.path.basename(filename)}"
+    """Path inside the library, e.g. All Songs/Artist - Title.mp3."""
+    return f"{library.ALL_SONGS}/{os.path.basename(filename)}"
 
 
 def format_saved_reply(
@@ -361,10 +371,10 @@ async def run_music_dl(arg: str, music_dir: str) -> tuple[int, str, str]:
     Run `music-dl <arg>` in one-shot mode. `arg` is a direct URL (YouTube,
     SoundCloud, …) or a search string. music-dl runs from its own directory so
     its relative paths resolve as they do by hand; MUSIC_DIR / ARCHIVE are
-    passed in the child env so this user's library is used.
+    passed in the child env so this user's library (its All Songs/) is used.
     """
     extra_env = {
-        "MUSIC_DIR": music_dir,
+        "MUSIC_DIR": songs_dir(music_dir),
         "ARCHIVE": archive_for_music_dir(music_dir),
     }
     return await _run_subprocess(
@@ -381,7 +391,7 @@ async def run_spotdl(url: str, music_dir: str) -> tuple[int, str, str]:
     into this user's library (Spotify's own audio is DRM-protected and can't
     be pulled).
     """
-    outdir = music_dir
+    outdir = songs_dir(music_dir)
     os.makedirs(outdir, exist_ok=True)
     # Force mp3 and a clean "Artist - Title.mp3" name, saved into the music dir.
     output_template = os.path.join(outdir, "{artists} - {title}.{output-ext}")
@@ -402,7 +412,7 @@ async def run_spotdl(url: str, music_dir: str) -> tuple[int, str, str]:
 
 
 # Audio extensions we consider a "final" music file.
-_AUDIO_EXTS = {".mp3", ".m4a", ".opus", ".flac", ".wav", ".aac", ".ogg"}
+_AUDIO_EXTS = library.AUDIO_EXTS
 
 # Ordered by confidence. Each pattern captures a file path/name from a line of
 # music-dl / yt-dlp / ffmpeg output. We prefer patterns that name the FINAL
@@ -555,35 +565,39 @@ def summarize_result(
     stderr: str,
     found: list[str],
     music_dir: str,
-) -> str:
-    """Turn music-dl's output into a short, friendly reply for the user."""
+) -> tuple[str, list[str]]:
+    """
+    Turn music-dl's output into a short, friendly reply for the user, plus the
+    names of the files it saved (empty unless something new landed).
+    """
     if rc == -1:
-        return "⏱️ Timed out. The download took too long and was stopped."
+        return "⏱️ Timed out. The download took too long and was stopped.", []
 
     if rc == 0:
         filenames = _merge_names(extract_downloaded_filenames(stdout, stderr), found)
+        filenames = [n for n in filenames if (Path(songs_dir(music_dir)) / n).is_file()]
 
         if filenames:
-            return format_saved_reply(music_dir, filenames)
+            return format_saved_reply(music_dir, filenames), filenames
 
         # No filename in the output. If it was an archive skip, say so.
         if is_already_in_library(stdout, stderr):
             folder = Path(music_dir).name if music_dir else "Music"
-            return f"✅ Already in your library — skipped (no re-download).\nLooked in: {folder}/"
+            return f"✅ Already in your library — skipped (no re-download).\nLooked in: {folder}/", []
 
         folder = Path(music_dir).name if music_dir else "Music"
         tail = "\n".join(_strip_ansi(stdout + "\n" + stderr).splitlines()[-8:])[:800]
         return (
             f"❌ music-dl finished, but no new file appeared in {folder}/.\n"
             f"{tail or 'no output'}"
-        )
+        ), []
 
     log.warning(
         "music-dl failed rc=%s: %s",
         rc,
         "; ".join(_error_lines(stdout, stderr)) or "no ERROR line",
     )
-    return explain_download_failure("music-dl", rc, stdout, stderr)
+    return explain_download_failure("music-dl", rc, stdout, stderr), []
 
 
 # --------------------------------------------------------------------------- #
@@ -602,10 +616,10 @@ def summarize_spotdl(
     stderr: str,
     found: list[str],
     music_dir: str,
-) -> str:
+) -> tuple[str, list[str]]:
     """Turn spotdl's output into a friendly reply, naming each saved track."""
     if rc == -1:
-        return "⏱️ Timed out. The Spotify download took too long and was stopped."
+        return "⏱️ Timed out. The Spotify download took too long and was stopped.", []
 
     text = _strip_ansi(stdout + "\n" + stderr)
     downloaded = [m.group(1) for m in _SPOTDL_DOWNLOADED.finditer(text)]
@@ -613,130 +627,128 @@ def summarize_spotdl(
 
     # spotdl's "Downloaded" names have no extension; we save as .mp3.
     names = [n if n.lower().endswith(".mp3") else f"{n}.mp3" for n in downloaded]
-    names = _merge_names(names, found)
+    names = [n for n in _merge_names(names, found) if (Path(songs_dir(music_dir)) / n).is_file()]
 
     if rc == 0:
         if names:
-            return format_saved_reply(music_dir, names, via="spotify")
+            return format_saved_reply(music_dir, names, via="spotify"), names
         if skipped:
             skip_names = [n if n.lower().endswith(".mp3") else f"{n}.mp3" for n in skipped]
             folder = Path(music_dir).name if music_dir else "Music"
             listed = "\n".join(f"• {folder}/{os.path.basename(n)}" for n in skip_names)
-            return f"✅ Already in your library — skipped.\n{listed}"
+            return f"✅ Already in your library — skipped.\n{listed}", []
         folder = Path(music_dir).name if music_dir else "Music"
         tail = "\n".join(text.splitlines()[-8:])[:800]
         return (
             f"❌ Spotify download finished, but no new file appeared in {folder}/.\n"
             f"{tail or 'no output'}"
-        )
+        ), []
 
     log.warning(
         "spotdl failed rc=%s: %s",
         rc,
         "; ".join(_error_lines(stdout, stderr)) or "no ERROR line",
     )
-    return explain_download_failure("spotdl", rc, stdout, stderr)
+    return explain_download_failure("spotdl", rc, stdout, stderr), []
 
 
 # --------------------------------------------------------------------------- #
-# Shazam link resolution  (link -> "artist title" search string)
+# Shazam link resolution  (link -> artist, title, genre, year)
 # --------------------------------------------------------------------------- #
 
-_SHAZAM_TITLE_TAG = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
-_OG_TITLE = re.compile(
-    r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']',
-    re.IGNORECASE,
+# shazam.com answers page scrapes with HTTP 405 (bot wall), but its public
+# discovery API still serves the same track JSON the website renders from.
+SHAZAM_TRACK_API = "https://cdn.shazam.com/discovery/v5/en-US/US/web/-/track/{key}"
+_SHAZAM_TRACK = re.compile(r"/track/(\d+)")
+_SHAZAM_SONG = re.compile(r"/song/(\d+)")
+_BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
 )
 
 
-def _search_json_for_recording(obj) -> str | None:
-    """Recursively look for a MusicRecording-like dict and build 'artist title'."""
-    if isinstance(obj, dict):
-        types = obj.get("@type")
-        types = types if isinstance(types, list) else [types]
-        if any(t in ("MusicRecording", "MusicComposition", "Song") for t in types):
-            name = obj.get("name")
-            artist = obj.get("byArtist")
-            if isinstance(artist, dict):
-                artist = artist.get("name")
-            elif isinstance(artist, list) and artist:
-                first = artist[0]
-                artist = first.get("name") if isinstance(first, dict) else first
-            if name:
-                return f"{artist} {name}".strip() if artist else str(name)
-        for value in obj.values():
-            found = _search_json_for_recording(value)
-            if found:
-                return found
-    elif isinstance(obj, list):
-        for item in obj:
-            found = _search_json_for_recording(item)
-            if found:
-                return found
-    return None
+@dataclass
+class ShazamTrack:
+    artist: str
+    title: str
+    genre: str | None
+    year: int | None
+
+    @property
+    def query(self) -> str:
+        return f"{self.artist} {self.title}".strip()
 
 
-def resolve_shazam(url: str) -> str | None:
-    """
-    Turn a Shazam link into an "artist title" search string. Shazam is a song
-    ID service, not an audio source, so we scrape the shared page's metadata and
-    then let music-dl find the track on YouTube.
+def _fetch_json(url: str) -> dict:
+    req = urllib.request.Request(url, headers={"User-Agent": _BROWSER_UA})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
 
-    Strategy (most reliable first): JSON-LD MusicRecording -> og:title ->
-    <title> tag. Returns None if nothing usable can be extracted.
-    """
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0 Safari/537.36"
-            )
-        },
-    )
+
+def _expand_short_link(url: str) -> str:
+    """Follow a shz.am-style redirect to the real shazam.com URL."""
+    req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": _BROWSER_UA})
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
-            html_text = resp.read().decode("utf-8", "replace")
-    except Exception as exc:  # network/HTTP errors — degrade gracefully
-        log.warning("Shazam fetch failed for %s: %s", url, exc)
-        return None
+            return resp.geturl()
+    except urllib.error.HTTPError as exc:  # the 405 wall still reports where we landed
+        return exc.geturl() or url
+    except Exception as exc:
+        log.warning("Could not expand Shazam link %s: %s", url, exc)
+        return url
 
-    # 1) JSON-LD blocks (most structured/reliable).
-    for block in re.findall(
-        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-        html_text,
-        re.IGNORECASE | re.DOTALL,
-    ):
+
+def resolve_shazam(url: str) -> ShazamTrack | None:
+    """
+    Turn a Shazam link into artist/title (plus Apple's genre and release
+    year, used for the genre folder). Shazam is a song ID service, not an
+    audio source, so music-dl then finds the track on YouTube.
+
+    Link shapes: shazam.com/track/<shazam key>/<slug> (the app's share link,
+    resolved through the discovery API), shazam.com/song/<apple id>/<slug>
+    (an Apple Music id, resolved through the iTunes lookup API), optionally
+    with a locale prefix; short links are expanded first.
+    """
+    if not (_SHAZAM_TRACK.search(url) or _SHAZAM_SONG.search(url)):
+        url = _expand_short_link(url)
+
+    if m := _SHAZAM_TRACK.search(url):
         try:
-            data = json.loads(block.strip())
-        except json.JSONDecodeError:
-            continue
-        found = _search_json_for_recording(data)
-        if found:
-            return _clean_query(found)
+            data = _fetch_json(SHAZAM_TRACK_API.format(key=m.group(1)))
+        except Exception as exc:
+            log.warning("Shazam track API failed for %s: %s", url, exc)
+            return None
+        if not data.get("title"):
+            return None
+        released = next(
+            (
+                meta.get("text")
+                for section in data.get("sections", [])
+                for meta in section.get("metadata") or []
+                if meta.get("title") == "Released"
+            ),
+            data.get("releasedate"),
+        )
+        return ShazamTrack(
+            artist=data.get("subtitle", ""),
+            title=data["title"],
+            genre=(data.get("genres") or {}).get("primary"),
+            year=library.year_of(released),
+        )
 
-    # 2) og:title meta.
-    m = _OG_TITLE.search(html_text)
-    if m:
-        return _clean_query(m.group(1))
+    if m := _SHAZAM_SONG.search(url):
+        track = library.itunes_lookup(m.group(1))
+        if not track:
+            return None
+        return ShazamTrack(
+            artist=track.get("artistName", ""),
+            title=track.get("trackName", ""),
+            genre=track.get("primaryGenreName"),
+            year=library.year_of(track.get("releaseDate")),
+        )
 
-    # 3) <title> tag, e.g. "Song - Artist | Shazam".
-    m = _SHAZAM_TITLE_TAG.search(html_text)
-    if m:
-        title = re.sub(r"\s*\|\s*Shazam.*$", "", m.group(1), flags=re.IGNORECASE)
-        return _clean_query(title.replace(" - ", " "))
-
+    log.warning("Unrecognized Shazam link: %s", url)
     return None
-
-
-def _clean_query(text: str) -> str:
-    """Normalize an extracted title into a plain search string."""
-    import html as _html
-
-    text = _html.unescape(text).strip()
-    text = re.sub(r"\s+", " ", text)
-    return text
 
 
 # --------------------------------------------------------------------------- #
@@ -929,8 +941,11 @@ HELP_TEXT = (
     "You can also:\n"
     "• Send a song name (e.g. `daft punk one more time`) — I'll search YouTube.\n"
     "• Send several links at once, one per line — I'll grab them all.\n\n"
+    "Every song goes in *All Songs* plus a genre + decade folder "
+    "(e.g. *Dembow 2020s*). Tap ✏️ under a download to fix its genre.\n\n"
     "Commands:\n"
     "/start, /help — this message\n"
+    "/unknown — sort songs whose genre I couldn't figure out\n"
     "/id — show your Telegram user ID (needed for the allowlist)"
 )
 
@@ -958,54 +973,248 @@ async def cmd_id(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def process_job(kind: str, value: str, music_dir: str) -> str:
-    """Run one download job and return the reply text. Never raises."""
+@dataclass
+class JobResult:
+    reply: str
+    saved: list[str]                      # filenames now in All Songs/
+    shazam: ShazamTrack | None = None     # genre/year hints for categorizing
+
+
+async def _music_dl_job(arg: str, music_dir: str) -> JobResult:
+    """Run music-dl for a URL or search phrase and summarize what it saved."""
+    try:
+        before = audio_names(songs_dir(music_dir))
+        rc, out, err = await run_music_dl(arg, music_dir)
+    except FileNotFoundError:
+        return JobResult(
+            "❌ Could not run music-dl.\n"
+            f"MUSIC_DL is set to: {MUSIC_DL or '(unset)'}\n"
+            "Check that the path is correct and the file is executable.",
+            [],
+        )
+    log_job_output("music-dl", rc, out, err)
+    found = new_audio_files(before, songs_dir(music_dir))
+    return JobResult(*summarize_result(rc, out, err, found, music_dir))
+
+
+async def process_job(kind: str, value: str, music_dir: str) -> JobResult:
+    """Run one download job and return the reply + saved files. Never raises."""
     try:
         if kind == "spotify":
             try:
-                started = time.time()
+                before = audio_names(songs_dir(music_dir))
                 rc, out, err = await run_spotdl(value, music_dir)
             except FileNotFoundError:
-                return (
+                return JobResult(
                     "❌ Spotify links need spotdl, which isn't installed.\n"
                     "Install it in the bot's venv:\n"
-                    "  <venv>/bin/python3 -m pip install spotdl"
+                    "  <venv>/bin/python3 -m pip install spotdl",
+                    [],
                 )
             log_job_output("spotdl", rc, out, err)
-            found = new_audio_files(started, music_dir)
-            return summarize_spotdl(rc, out, err, found, music_dir)
+            found = new_audio_files(before, songs_dir(music_dir))
+            return JobResult(*summarize_spotdl(rc, out, err, found, music_dir))
 
         if kind == "shazam":
-            query = await asyncio.to_thread(resolve_shazam, value)
-            if not query:
-                return (
+            track = await asyncio.to_thread(resolve_shazam, value)
+            if not track:
+                return JobResult(
                     "❌ Couldn't read that Shazam link. Try opening it and "
-                    "sending me the song name instead."
+                    "sending me the song name instead.",
+                    [],
                 )
-            started = time.time()
-            rc, out, err = await run_music_dl(query, music_dir)
-            log_job_output("music-dl", rc, out, err)
-            found = new_audio_files(started, music_dir)
-            base = summarize_result(rc, out, err, found, music_dir)
-            return f"🎧 Shazam → {query}\n{base}"
+            result = await _music_dl_job(track.query, music_dir)
+            result.reply = f"🎧 Shazam → {track.artist} - {track.title}\n{result.reply}"
+            result.shazam = track
+            return result
 
         # "direct" (YouTube/SoundCloud/etc.) or "search" — both go to music-dl.
-        try:
-            started = time.time()
-            rc, out, err = await run_music_dl(value, music_dir)
-        except FileNotFoundError:
-            return (
-                "❌ Could not run music-dl.\n"
-                f"MUSIC_DL is set to: {MUSIC_DL or '(unset)'}\n"
-                "Check that the path is correct and the file is executable."
-            )
-        log_job_output("music-dl", rc, out, err)
-        found = new_audio_files(started, music_dir)
-        return summarize_result(rc, out, err, found, music_dir)
+        return await _music_dl_job(value, music_dir)
 
     except Exception as exc:  # defensive: never let a job crash the handler
         log.exception("Unexpected error in job %s(%r)", kind, value)
-        return f"❌ Unexpected error: {exc}"
+        return JobResult(f"❌ Unexpected error: {exc}", [])
+
+
+# --------------------------------------------------------------------------- #
+# Genre tags + correction buttons
+# --------------------------------------------------------------------------- #
+#
+# Callback data is "action|file id|genre idx|decade idx|mode" (Telegram caps
+# it at 64 bytes, so files are referenced by library.file_id()):
+#   g  open the genre picker        s  genre picked -> decade picker
+#   d  decade picked -> save        x  cancel, back to the ✏️ button
+#   k  skip this song (/unknown queue only)
+# mode "q" marks the /unknown queue, which moves on to the next song after a
+# choice instead of just updating the message.
+
+TAG_PREFIX = "🏷 "
+NOT_SURE = "n"
+
+
+def _cb(action: str, fid: str, gi: int | str = "", di: int | str = "", mode: str = "") -> str:
+    return f"{action}|{fid}|{gi}|{di}|{mode}"
+
+
+def tag_line(cat: library.Category) -> str:
+    if cat.genre == library.UNKNOWN:
+        return f"{TAG_PREFIX}Genre: Unknown — which is it?"
+    return f"{TAG_PREFIX}{cat.label}"
+
+
+def change_button(fid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✏️ Change genre", callback_data=_cb("g", fid))]])
+
+
+def genre_picker(fid: str, mode: str = "") -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(genre, callback_data=_cb("s", fid, i, mode=mode))
+        for i, genre in enumerate(library.GENRES)
+    ]
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    last = ("⏭ Skip", _cb("k", fid, mode=mode)) if mode == "q" else ("Cancel", _cb("x", fid))
+    rows.append([InlineKeyboardButton(last[0], callback_data=last[1])])
+    return InlineKeyboardMarkup(rows)
+
+
+def decade_picker(fid: str, gi: int, mode: str = "") -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(decade, callback_data=_cb("d", fid, gi, i, mode))
+        for i, decade in enumerate(library.DECADES)
+    ]
+    rows = [buttons[i:i + 4] for i in range(0, len(buttons), 4)]
+    rows.append([
+        InlineKeyboardButton("Not sure", callback_data=_cb("d", fid, gi, NOT_SURE, mode)),
+        InlineKeyboardButton("« Back", callback_data=_cb("g", fid, mode=mode)),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def tag_markup(fid: str, cat: library.Category) -> InlineKeyboardMarkup:
+    """Unknown songs open straight onto the picker; known ones get a ✏️ button."""
+    return genre_picker(fid) if cat.genre == library.UNKNOWN else change_button(fid)
+
+
+def _with_tag(text: str, cat: library.Category) -> str:
+    """Replace the 🏷 line of a reply (or append one)."""
+    lines = [ln for ln in text.splitlines() if not ln.startswith(TAG_PREFIX)]
+    return "\n".join(lines + [tag_line(cat)])
+
+
+async def send_tagged(message, music_dir: str, result: JobResult, prefix: str) -> None:
+    """Categorize each saved file, then reply with its genre + correction buttons."""
+    if not result.saved:
+        await message.reply_text((prefix + result.reply)[:MAX_TG_MESSAGE])
+        return
+
+    hints = {}
+    if result.shazam:
+        hints = {"hint_genre": result.shazam.genre, "hint_year": result.shazam.year}
+    cats = []
+    for name in result.saved:
+        try:
+            cats.append(await asyncio.to_thread(library.categorize_and_place, Path(music_dir), name, **hints))
+        except Exception:
+            log.exception("Categorizing %s failed", name)
+            cats.append(None)
+
+    if len(result.saved) == 1 and cats[0]:
+        text = _with_tag(prefix + result.reply, cats[0])
+        fid = library.file_id(result.saved[0])
+        await message.reply_text(text[:MAX_TG_MESSAGE], reply_markup=tag_markup(fid, cats[0]))
+        return
+
+    await message.reply_text((prefix + result.reply)[:MAX_TG_MESSAGE])
+    for name, cat in zip(result.saved, cats):
+        if cat:
+            fid = library.file_id(name)
+            await message.reply_text(f"🎵 {name}\n{tag_line(cat)}", reply_markup=tag_markup(fid, cat))
+
+
+async def send_next_unknown(bot, chat_id: int, music_dir: str, skipped: set[str]) -> None:
+    """Post the next Unknown song of this library with the genre picker."""
+    pending = [n for n in await asyncio.to_thread(library.unknown_names, Path(music_dir)) if n not in skipped]
+    if not pending:
+        await bot.send_message(chat_id, "🎉 No songs left with an unknown genre.")
+        return
+    name = pending[0]
+    prior = library.stored(Path(music_dir), name)
+    hint = f"\nBest guess: {prior.detail}" if prior and prior.detail else ""
+    await bot.send_message(
+        chat_id,
+        f"❓ {len(pending)} left\n🎵 {name}{hint}\nWhich genre is it?",
+        reply_markup=genre_picker(library.file_id(name), mode="q"),
+    )
+
+
+async def cmd_unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/unknown — walk through this user's songs filed under Unknown/."""
+    if not is_authorized(update):
+        await deny(update)
+        return
+    ctx.chat_data["skipped"] = set()
+    user_id = update.effective_user.id if update.effective_user else None
+    await send_next_unknown(
+        ctx.bot, update.effective_chat.id, music_dir_for_user(user_id), ctx.chat_data["skipped"]
+    )
+
+
+async def handle_genre_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Genre/decade picker buttons. Each user can only re-file songs in their own library."""
+    query = update.callback_query
+    if not is_authorized(update):
+        await query.answer("Not authorized.", show_alert=True)
+        return
+    action, fid, gi, di, mode = (query.data.split("|") + [""] * 5)[:5]
+    music_dir = music_dir_for_user(update.effective_user.id)
+    lib = Path(music_dir)
+    name = await asyncio.to_thread(library.name_for_id, lib, fid)
+    if not name:
+        await query.answer("That song isn't in your library anymore.", show_alert=True)
+        return
+    await query.answer()
+
+    # Messages older than 48h arrive as InaccessibleMessage: no text, no edit
+    # helpers. Fall back to a rebuilt text and edit by chat/message id.
+    chat_id, message_id = query.message.chat.id, query.message.message_id
+    current = library.stored(lib, name) or library.Category()
+    text = getattr(query.message, "text", None) or f"🎵 {name}\n{tag_line(current)}"
+    skipped = ctx.chat_data.setdefault("skipped", set())
+
+    async def edit(new_text: str | None, markup: InlineKeyboardMarkup | None = None) -> None:
+        try:
+            if new_text is None:
+                await ctx.bot.edit_message_reply_markup(chat_id, message_id, reply_markup=markup)
+            else:
+                await ctx.bot.edit_message_text(new_text, chat_id, message_id, reply_markup=markup)
+        except BadRequest as exc:  # double taps: "message is not modified"
+            log.info("Edit skipped: %s", exc)
+
+    if action == "g":
+        await edit(None, genre_picker(fid, mode))
+    elif action == "s":
+        # The last line is the 🏷 tag (or the /unknown question): swap in the prompt.
+        genre = library.GENRES[int(gi)]
+        await edit(text.rsplit("\n", 1)[0] + f"\n{TAG_PREFIX}{genre} · which decade?", decade_picker(fid, int(gi), mode))
+    elif action == "x":
+        await edit(_with_tag(text, current), tag_markup(fid, current))
+    elif action == "k":
+        skipped.add(name)
+        await edit(f"⏭ Skipped {name}")
+        await send_next_unknown(ctx.bot, chat_id, music_dir, skipped)
+    elif action == "d":
+        genre = library.GENRES[int(gi)]
+        decade = None if di == NOT_SURE else library.DECADES[int(di)]
+        cat = await asyncio.to_thread(library.set_user_choice, lib, name, genre, decade)
+        log.info("User %s filed %s under %s", update.effective_user.id, name, cat.folder)
+        if mode == "q":
+            await edit(f"✔️ {name}\n→ {cat.folder}/")
+            await send_next_unknown(ctx.bot, chat_id, music_dir, skipped)
+        else:
+            await edit(_with_tag(text, cat) + " ✔️", change_button(fid))
+
+
+_library_locks: dict[str, asyncio.Lock] = {}
 
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1044,10 +1253,13 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     await message.reply_text(ack)
     await ctx.bot.send_chat_action(message.chat_id, ChatAction.TYPING)
 
-    for i, (kind, value) in enumerate(jobs, start=1):
-        prefix = f"[{i}/{len(jobs)}] " if len(jobs) > 1 else ""
-        reply = await process_job(kind, value, music_dir)
-        await message.reply_text((prefix + reply)[:MAX_TG_MESSAGE])
+    # One download at a time per library: music-dl's exit trap wipes the
+    # shared All Songs/.tmp, which would kill a concurrent run's partial file.
+    async with _library_locks.setdefault(music_dir, asyncio.Lock()):
+        for i, (kind, value) in enumerate(jobs, start=1):
+            prefix = f"[{i}/{len(jobs)}] " if len(jobs) > 1 else ""
+            result = await process_job(kind, value, music_dir)
+            await send_tagged(message, music_dir, result, prefix)
 
 
 # --------------------------------------------------------------------------- #
@@ -1108,7 +1320,11 @@ def main() -> None:
 
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
     app.add_handler(CommandHandler("id", cmd_id))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CommandHandler("unknown", cmd_unknown))
+    app.add_handler(CallbackQueryHandler(handle_genre_button))
+    # block=False: a download can run for minutes; genre buttons and commands
+    # must stay responsive meanwhile (handle_message serializes per library).
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message, block=False))
 
     # --- Python 3.14 compatibility shim ---------------------------------- #
     # python-telegram-bot 21.6's run_polling() calls asyncio.get_event_loop()
